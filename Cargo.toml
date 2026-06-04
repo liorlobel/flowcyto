@@ -1,0 +1,23 @@
+[package]
+name = "flowcyto"
+version = "0.1.0"
+edition = "2021"
+description = "Flow cytometry FCS file analyzer — compensation, asinh transform, gating, stats"
+
+[[bin]]
+name = "flowcyto"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+byteorder = "1"
+nalgebra = { version = "0.33", default-features = false, features = ["std"] }
+csv = "1"
+thiserror = "1"
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow"] }
+egui = "0.29"
+egui_plot = "0.29"
+rfd = "0.15"
