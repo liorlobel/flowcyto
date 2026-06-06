@@ -181,3 +181,135 @@ pub fn append_long_csv(out: &mut String, sample: &str, table: &PopulationStatsTa
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gating::GateShape;
+    use crate::test_util::param;
+    use crate::transform::AxisTransform;
+
+    fn rect_gate(id: u32, parent: Option<u32>, name: &str, xmin: f64, xmax: f64) -> Gate {
+        Gate {
+            id,
+            name: name.to_string(),
+            parent,
+            x_channel: "X".to_string(),
+            y_channel: "Y".to_string(),
+            x_transform: AxisTransform::Linear,
+            y_transform: AxisTransform::Linear,
+            shape: GateShape::Rect { x_min: xmin, x_max: xmax, y_min: -1.0, y_max: 1.0 },
+            quad_group: None,
+        }
+    }
+
+    #[test]
+    fn root_row_is_all_events() {
+        let params = vec![param(1, "X"), param(2, "Y")];
+        let events = vec![1.0, 0.0, 2.0, 0.0, 3.0, 0.0];
+        let table = population_stats(&events, &params, 3, &[], &[0]);
+        assert_eq!(table.rows.len(), 1);
+        assert_eq!(table.rows[0].name, "All events");
+        assert_eq!(table.rows[0].count, 3);
+        assert!((table.rows[0].pct_total - 100.0).abs() < 1e-9);
+        // Median of X over {1,2,3} = 2.
+        assert_eq!(table.rows[0].medians[0], 2.0);
+    }
+
+    #[test]
+    fn counts_and_percentages_match_gate_tree() {
+        let params = vec![param(1, "X"), param(2, "Y")];
+        // x = 1,2,3,4,10 (y=0).
+        let events = vec![1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 4.0, 0.0, 10.0, 0.0];
+        let parent = rect_gate(1, None, "P", 0.0, 5.0);     // 4 events
+        let child = rect_gate(2, Some(1), "C", 0.0, 2.5);    // 2 events
+        let table = population_stats(&events, &params, 5, &[parent, child], &[0]);
+
+        // Rows: All events, P, C.
+        assert_eq!(table.rows.len(), 3);
+        let p = &table.rows[1];
+        let c = &table.rows[2];
+        assert_eq!(p.count, 4);
+        assert!((p.pct_total - 80.0).abs() < 1e-9);
+        assert!((p.pct_parent - 80.0).abs() < 1e-9); // parent is root (5 events)
+        assert_eq!(c.count, 2);
+        assert_eq!(c.parent_name, "P");
+        assert!((c.pct_parent - 50.0).abs() < 1e-9); // 2 of P's 4
+        assert!((c.pct_total - 40.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn missing_channel_gate_reads_zero_not_parent() {
+        // A gate on a channel this sample lacks must report 0, not collapse to parent.
+        let params = vec![param(1, "X"), param(2, "Y")];
+        let events = vec![1.0, 0.0, 2.0, 0.0];
+        let mut g = rect_gate(1, None, "bad", 0.0, 10.0);
+        g.x_channel = "ABSENT".to_string();
+        let table = population_stats(&events, &params, 2, &[g], &[0]);
+        assert_eq!(table.rows[1].count, 0);
+    }
+
+    #[test]
+    fn med_mean_cv_known_values() {
+        let (med, mean, cv) = med_mean_cv(&mut [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]);
+        assert_eq!(med, 4.5);
+        assert!((mean - 5.0).abs() < 1e-12);
+        // Sample SD (n-1): sum of squared deviations = 32, /(8-1) = 32/7.
+        let cv_expected = 100.0 * (32.0f64 / 7.0).sqrt() / 5.0;
+        assert!((cv - cv_expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn med_mean_cv_empty_is_nan() {
+        let (med, mean, cv) = med_mean_cv(&mut []);
+        assert!(med.is_nan() && mean.is_nan() && cv.is_nan());
+    }
+
+    #[test]
+    fn long_csv_escapes_commas_in_names() {
+        let table = PopulationStatsTable {
+            channels: vec!["FITC-A".to_string()],
+            rows: vec![PopulationStat {
+                name: "CD11c+, MHCII+".to_string(), // contains a comma
+                parent_name: "Live".to_string(),
+                depth: 1,
+                count: 10,
+                pct_parent: 50.0,
+                pct_total: 25.0,
+                medians: vec![1234.5],
+                means: vec![1200.0],
+                cvs: vec![30.0],
+            }],
+        };
+        let mut out = String::new();
+        append_long_csv(&mut out, "sampleA", &table);
+        assert!(out.contains("\"CD11c+, MHCII+\""), "comma'd name must be quoted: {out}");
+    }
+
+    #[test]
+    fn long_csv_grouped_prepends_group() {
+        let table = PopulationStatsTable {
+            channels: vec!["FITC-A".to_string()],
+            rows: vec![PopulationStat {
+                name: "P".to_string(),
+                parent_name: "All events".to_string(),
+                depth: 1,
+                count: 5,
+                pct_parent: 100.0,
+                pct_total: 100.0,
+                medians: vec![1.0],
+                means: vec![1.0],
+                cvs: vec![0.0],
+            }],
+        };
+        let mut out = String::new();
+        append_long_csv_grouped(&mut out, "high_SAA", "tube1", &table);
+        assert!(out.starts_with("high_SAA,tube1,P,"), "got: {out}");
+    }
+
+    #[test]
+    fn header_constants_column_counts() {
+        assert_eq!(LONG_CSV_HEADER.split(',').count(), 11);
+        assert_eq!(LONG_CSV_HEADER_GROUPED.split(',').count(), 12);
+    }
+}

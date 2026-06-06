@@ -188,3 +188,99 @@ fn write_hdr_offset(field: &mut [u8], v: usize) {
     };
     field.copy_from_slice(s.as_bytes());
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::make_fcs;
+
+    fn temp(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("flowcyto_write_{}_{}.fcs", std::process::id(), tag))
+    }
+
+    #[test]
+    fn write_open_round_trip_preserves_events() {
+        let fcs = make_fcs(
+            &["FSC-A", "FITC-A", "PE-A"],
+            &[vec![100.0, 10.0, 1.0], vec![200.0, 20.0, 2.0]],
+        );
+        let path = temp("rt");
+        write_fcs(&fcs, None, &path).unwrap();
+        let back = FcsFile::open(&path).unwrap();
+
+        assert_eq!(back.n_events, 2);
+        assert_eq!(back.n_params(), 3);
+        // f32 round-trip: these integers are exact.
+        assert_eq!(back.events, fcs.events);
+        assert_eq!(back.param_index("PE-A"), Some(2));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_override_spillover() {
+        let fcs = make_fcs(&["FITC-A", "PE-A"], &[vec![1.0, 2.0]]);
+        let path = temp("override");
+        let spill = "2,FITC-A,PE-A,1,0.2,0.05,1";
+        write_fcs(&fcs, Some(spill), &path).unwrap();
+        let back = FcsFile::open(&path).unwrap();
+        assert_eq!(back.spillover_keyword(), Some(spill));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_preserves_embedded_spillover_when_none() {
+        let mut fcs = make_fcs(&["FITC-A", "PE-A"], &[vec![1.0, 2.0]]);
+        fcs.keywords.insert("$SPILLOVER".to_string(), "1,FITC-A,1".to_string());
+        let path = temp("preserve");
+        write_fcs(&fcs, None, &path).unwrap();
+        let back = FcsFile::open(&path).unwrap();
+        assert_eq!(back.spillover_keyword(), Some("1,FITC-A,1"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_rejects_empty_file() {
+        let fcs = make_fcs(&["A"], &[]); // 0 events
+        let path = temp("empty");
+        assert!(write_fcs(&fcs, None, &path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn is_controlled_covers_keywords() {
+        assert!(is_controlled("$PAR"));
+        assert!(is_controlled("$DATATYPE"));
+        assert!(is_controlled("$SPILLOVER"));
+        assert!(is_controlled("$P1B"));
+        assert!(is_controlled("$P12E"));
+        assert!(!is_controlled("$P1N"));
+        assert!(!is_controlled("$CYT"));
+    }
+
+    #[test]
+    fn is_pnb_or_pne_recognition() {
+        assert!(is_pnb_or_pne("$P1B"));
+        assert!(is_pnb_or_pne("$P99E"));
+        assert!(!is_pnb_or_pne("$P1N"));
+        assert!(!is_pnb_or_pne("$PB"));   // no digits
+        assert!(!is_pnb_or_pne("$P1X"));
+    }
+
+    #[test]
+    fn pick_delimiter_avoids_clashes() {
+        // Default candidate is FF (12); a clean keyword set should pick it.
+        let kws = vec![("$PAR".to_string(), "2".to_string())];
+        assert_eq!(pick_delimiter(&kws), Some(12));
+    }
+
+    #[test]
+    fn copies_through_extra_keywords() {
+        let mut fcs = make_fcs(&["FITC-A"], &[vec![1.0]]);
+        fcs.keywords.insert("$CYT".to_string(), "FACSAria".to_string());
+        let path = temp("extra");
+        write_fcs(&fcs, None, &path).unwrap();
+        let back = FcsFile::open(&path).unwrap();
+        assert_eq!(back.keywords.get("$CYT").map(|s| s.as_str()), Some("FACSAria"));
+        let _ = std::fs::remove_file(&path);
+    }
+}

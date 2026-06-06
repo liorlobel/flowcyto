@@ -96,3 +96,65 @@ pub fn print_stats_table(stats: &[Stats]) {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_known_values() {
+        let s = Stats::compute("X", &[2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]);
+        assert_eq!(s.n, 8);
+        assert!((s.mean - 5.0).abs() < 1e-12);
+        // Sample SD (n-1): sum of squared deviations = 32, /(8-1) = 32/7.
+        let sd = (32.0f64 / 7.0).sqrt();
+        assert!((s.std - sd).abs() < 1e-12);
+        assert!((s.cv - 100.0 * sd / 5.0).abs() < 1e-9);
+        assert_eq!(s.min, 2.0);
+        assert_eq!(s.max, 9.0);
+    }
+
+    #[test]
+    fn median_via_percentile_even_n() {
+        // Linear-interpolation percentile: median of {1,2,3,4} = 2.5.
+        let s = Stats::compute("X", &[1.0, 2.0, 3.0, 4.0]);
+        assert!((s.median - 2.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn geo_mean_positive_only() {
+        // Geometric mean of {1,10,100} = 10; negatives are ignored.
+        let s = Stats::compute("X", &[1.0, 10.0, 100.0, -5.0]);
+        assert!((s.geo_mean - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn geo_mean_all_nonpositive_is_nan() {
+        let s = Stats::compute("X", &[-1.0, 0.0, -3.0]);
+        assert!(s.geo_mean.is_nan());
+    }
+
+    #[test]
+    fn empty_is_all_nan() {
+        let s = Stats::compute("X", &[]);
+        assert_eq!(s.n, 0);
+        assert!(s.mean.is_nan() && s.median.is_nan() && s.cv.is_nan());
+    }
+
+    #[test]
+    fn single_value_has_zero_sd() {
+        let s = Stats::compute("X", &[42.0]);
+        assert_eq!(s.std, 0.0);
+        assert_eq!(s.median, 42.0);
+        assert_eq!(s.p05, 42.0);
+        assert_eq!(s.p95, 42.0);
+    }
+
+    #[test]
+    fn percentile_endpoints() {
+        let sorted = [0.0, 1.0, 2.0, 3.0, 4.0];
+        assert_eq!(percentile_sorted(&sorted, 0.0), 0.0);
+        assert_eq!(percentile_sorted(&sorted, 100.0), 4.0);
+        assert_eq!(percentile_sorted(&sorted, 50.0), 2.0);
+    }
+}

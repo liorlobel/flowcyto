@@ -144,3 +144,118 @@ pub fn fluorescence_indices(params: &[crate::fcs::Parameter]) -> Vec<usize> {
         .map(|(i, _)| i)
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::param;
+
+    fn round_trip(t: &AxisTransform, x: f64) {
+        let c = t.compile();
+        let back = c.inverse(c.forward(x));
+        assert!(
+            (back - x).abs() < 1e-6 * (x.abs() + 1.0),
+            "{:?} round-trip failed: {} → {}",
+            t, x, back
+        );
+    }
+
+    #[test]
+    fn linear_round_trip() {
+        for &x in &[-100.0, 0.0, 42.0, 1e5] {
+            round_trip(&AxisTransform::Linear, x);
+        }
+    }
+
+    #[test]
+    fn log_round_trip_and_floor() {
+        let t = AxisTransform::Log { floor: 1.0 };
+        for &x in &[1.0, 10.0, 1000.0, 262144.0] {
+            round_trip(&t, x);
+        }
+        // Values below the floor clamp to log10(floor) = 0.
+        assert_eq!(t.compile().forward(0.5), 0.0);
+        assert_eq!(t.compile().forward(-50.0), 0.0);
+    }
+
+    #[test]
+    fn asinh_round_trip() {
+        let t = AxisTransform::Asinh { cofactor: 150.0 };
+        for &x in &[-1000.0, -10.0, 0.0, 10.0, 1000.0, 262144.0] {
+            round_trip(&t, x);
+        }
+    }
+
+    #[test]
+    fn asinh_matches_free_function() {
+        let c = CompiledTransform::Asinh { cofactor: 5.0 };
+        assert!((c.forward(37.0) - asinh(37.0, 5.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn logicle_round_trip_and_m_scaling() {
+        let t = AxisTransform::default_logicle();
+        for &x in &[-1000.0, 0.0, 100.0, 10000.0, 262144.0] {
+            round_trip(&t, x);
+        }
+        // forward output should land in the [0, M] decade range.
+        let c = t.compile();
+        let top = c.forward(262144.0);
+        assert!((top - DEFAULT_LOGICLE_M).abs() < 1e-3, "top decade ≈ M, got {}", top);
+    }
+
+    #[test]
+    fn logicle_invalid_params_fall_back_to_linear() {
+        // W too large for M makes Logicle::new fail → compile() falls back to Linear.
+        let bad = AxisTransform::Logicle { t: 262144.0, w: 100.0, m: 4.5, a: 0.0 };
+        let c = bad.compile();
+        assert!(matches!(c, CompiledTransform::Linear));
+        // And forward is then identity (no panic).
+        assert_eq!(c.forward(123.0), 123.0);
+    }
+
+    #[test]
+    fn apply_asinh_only_touches_selected_indices() {
+        // 2 events × 3 params; transform only column 1.
+        let mut events = vec![10.0, 100.0, 1000.0, 20.0, 200.0, 2000.0];
+        apply_asinh(&mut events, 3, &[1], 150.0);
+        assert_eq!(events[0], 10.0, "col 0 untouched");
+        assert_eq!(events[2], 1000.0, "col 2 untouched");
+        assert!((events[1] - asinh(100.0, 150.0)).abs() < 1e-12);
+        assert!((events[4] - asinh(200.0, 150.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn fluorescence_indices_excludes_scatter_and_time() {
+        let params = vec![
+            param(1, "FSC-A"),
+            param(2, "SSC-H"),
+            param(3, "FITC-A"),
+            param(4, "PE-A"),
+            param(5, "Time"),
+        ];
+        assert_eq!(fluorescence_indices(&params), vec![2, 3]);
+    }
+
+    #[test]
+    fn axis_transform_serde_round_trip() {
+        for t in [
+            AxisTransform::Linear,
+            AxisTransform::default_log(),
+            AxisTransform::Asinh { cofactor: 150.0 },
+            AxisTransform::default_logicle(),
+        ] {
+            let json = serde_json::to_string(&t).unwrap();
+            let back: AxisTransform = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, t);
+        }
+    }
+
+    #[test]
+    fn short_label_is_stable() {
+        assert_eq!(AxisTransform::Linear.short_label(), "Linear");
+        assert_eq!(AxisTransform::default_log().short_label(), "Log");
+        assert_eq!(AxisTransform::Asinh { cofactor: 1.0 }.short_label(), "Asinh");
+        assert_eq!(AxisTransform::default_logicle().short_label(), "Logicle");
+    }
+}

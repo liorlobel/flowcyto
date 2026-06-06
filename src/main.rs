@@ -10,6 +10,8 @@ mod gui;
 mod logicle;
 mod popstats;
 mod stats;
+#[cfg(test)]
+mod test_util;
 mod transform;
 
 use std::path::{Path, PathBuf};

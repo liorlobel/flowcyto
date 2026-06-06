@@ -264,3 +264,197 @@ fn point_in_polygon(px: f64, py: f64, verts: &[[f64; 2]]) -> bool {
     }
     inside
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::param;
+
+    fn gate(id: u32, name: &str, parent: Option<u32>, shape: GateShape) -> Gate {
+        Gate {
+            id,
+            name: name.to_string(),
+            parent,
+            x_channel: "X".to_string(),
+            y_channel: "Y".to_string(),
+            x_transform: AxisTransform::Linear,
+            y_transform: AxisTransform::Linear,
+            shape,
+            quad_group: None,
+        }
+    }
+
+    // ── GateShape::contains ────────────────────────────────────────────────
+
+    #[test]
+    fn rect_contains() {
+        let r = GateShape::Rect { x_min: 0.0, x_max: 10.0, y_min: 0.0, y_max: 10.0 };
+        assert!(r.contains(5.0, 5.0));
+        assert!(r.contains(0.0, 0.0)); // boundary inclusive
+        assert!(r.contains(10.0, 10.0));
+        assert!(!r.contains(-0.1, 5.0));
+        assert!(!r.contains(5.0, 10.1));
+    }
+
+    #[test]
+    fn range_ignores_y() {
+        let r = GateShape::Range { x_min: 1.0, x_max: 3.0 };
+        assert!(r.contains(2.0, -9999.0));
+        assert!(!r.contains(0.5, 0.0));
+    }
+
+    #[test]
+    fn ellipse_axis_aligned() {
+        let e = GateShape::Ellipse { cx: 0.0, cy: 0.0, rx: 2.0, ry: 1.0, angle: 0.0 };
+        assert!(e.contains(0.0, 0.0));
+        assert!(e.contains(2.0, 0.0)); // on boundary along major axis
+        assert!(e.contains(0.0, 1.0));
+        assert!(!e.contains(0.0, 1.5));
+        assert!(!e.contains(2.0, 1.0));
+    }
+
+    #[test]
+    fn ellipse_rotated_90_degrees() {
+        // Rotating a 2×1 ellipse by 90° swaps which axis is long.
+        let e = GateShape::Ellipse {
+            cx: 0.0, cy: 0.0, rx: 2.0, ry: 1.0,
+            angle: std::f64::consts::FRAC_PI_2,
+        };
+        // Now the long axis is vertical: (0, 2) inside, (2, 0) outside.
+        assert!(e.contains(0.0, 1.9));
+        assert!(!e.contains(1.9, 0.0));
+    }
+
+    #[test]
+    fn ellipse_zero_radius_is_empty() {
+        let e = GateShape::Ellipse { cx: 0.0, cy: 0.0, rx: 0.0, ry: 1.0, angle: 0.0 };
+        assert!(!e.contains(0.0, 0.0));
+    }
+
+    #[test]
+    fn polygon_triangle_and_concave() {
+        let tri = GateShape::Polygon {
+            vertices: vec![[0.0, 0.0], [4.0, 0.0], [2.0, 4.0]],
+        };
+        assert!(tri.contains(2.0, 1.0));
+        assert!(!tri.contains(0.0, 3.0));
+
+        // Degenerate polygon (< 3 vertices) contains nothing.
+        let line = GateShape::Polygon { vertices: vec![[0.0, 0.0], [1.0, 1.0]] };
+        assert!(!line.contains(0.5, 0.5));
+    }
+
+    #[test]
+    fn outline_rect_is_closed() {
+        let r = GateShape::Rect { x_min: 0.0, x_max: 1.0, y_min: 0.0, y_max: 1.0 };
+        let o = r.outline();
+        assert_eq!(o.first(), o.last());
+        assert_eq!(o.len(), 5);
+    }
+
+    #[test]
+    fn label_anchor_rect_top_center() {
+        let r = GateShape::Rect { x_min: 0.0, x_max: 10.0, y_min: 0.0, y_max: 4.0 };
+        assert_eq!(r.label_anchor(), [5.0, 4.0]);
+    }
+
+    // ── tree ordering ──────────────────────────────────────────────────────
+
+    #[test]
+    fn tree_order_parents_before_children() {
+        let g = vec![
+            gate(1, "root", None, GateShape::Rect { x_min: 0.0, x_max: 1.0, y_min: 0.0, y_max: 1.0 }),
+            gate(2, "child", Some(1), GateShape::Rect { x_min: 0.0, x_max: 1.0, y_min: 0.0, y_max: 1.0 }),
+            gate(3, "grandchild", Some(2), GateShape::Rect { x_min: 0.0, x_max: 1.0, y_min: 0.0, y_max: 1.0 }),
+        ];
+        let order = gate_tree_order(&g);
+        assert_eq!(order, vec![(1, 0), (2, 1), (3, 2)]);
+    }
+
+    #[test]
+    fn tree_order_appends_orphans() {
+        // Gate 2's parent (99) is absent → it's an orphan, must still appear.
+        let g = vec![
+            gate(1, "root", None, GateShape::Rect { x_min: 0.0, x_max: 1.0, y_min: 0.0, y_max: 1.0 }),
+            gate(2, "orphan", Some(99), GateShape::Rect { x_min: 0.0, x_max: 1.0, y_min: 0.0, y_max: 1.0 }),
+        ];
+        let order = gate_tree_order(&g);
+        assert!(order.iter().any(|&(id, _)| id == 2), "orphan must not be dropped");
+        assert_eq!(order.len(), 2);
+    }
+
+    // ── masks & counts ─────────────────────────────────────────────────────
+
+    fn xy(params: &[Parameter], events: &[f64], n: usize) -> (Vec<Parameter>, Vec<f64>, usize) {
+        (params.to_vec(), events.to_vec(), n)
+    }
+
+    #[test]
+    fn effective_mask_ands_with_ancestors() {
+        let params = vec![param(1, "X"), param(2, "Y")];
+        // Three events at x = 1, 5, 9 (y = 0).
+        let events = vec![1.0, 0.0, 5.0, 0.0, 9.0, 0.0];
+        let (params, events, n) = xy(&params, &events, 3);
+
+        let parent = gate(1, "P", None, GateShape::Rect { x_min: 0.0, x_max: 6.0, y_min: -1.0, y_max: 1.0 });
+        let child = gate(2, "C", Some(1), GateShape::Rect { x_min: 4.0, x_max: 100.0, y_min: -1.0, y_max: 1.0 });
+
+        let mut own = HashMap::new();
+        own.insert(1, gate_membership(&parent, &events, &params, n, 2).unwrap());
+        own.insert(2, gate_membership(&child, &events, &params, n, 2).unwrap());
+        let by_id: HashMap<u32, &Gate> =
+            [(1u32, &parent), (2u32, &child)].into_iter().collect();
+
+        // Parent admits x∈[0,6] → events 0,1. Child admits x≥4 → events 1,2.
+        // Effective child = AND → only event 1.
+        let eff = effective_mask(2, &by_id, &own, n);
+        assert_eq!(eff, vec![false, true, false]);
+    }
+
+    #[test]
+    fn effective_mask_cycle_guard_terminates() {
+        // a→b→a cycle; guard must stop rather than loop forever.
+        let a = gate(1, "a", Some(2), GateShape::Rect { x_min: 0.0, x_max: 1.0, y_min: 0.0, y_max: 1.0 });
+        let b = gate(2, "b", Some(1), GateShape::Rect { x_min: 0.0, x_max: 1.0, y_min: 0.0, y_max: 1.0 });
+        let by_id: HashMap<u32, &Gate> = [(1u32, &a), (2u32, &b)].into_iter().collect();
+        let mut own = HashMap::new();
+        own.insert(1, vec![true]);
+        own.insert(2, vec![true]);
+        let _ = effective_mask(1, &by_id, &own, 1); // must return, not hang
+    }
+
+    #[test]
+    fn apply_gates_counts_and_percentages() {
+        let params = vec![param(1, "X"), param(2, "Y")];
+        // 4 events at x = 1, 2, 3, 8.
+        let events = vec![1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 8.0, 0.0];
+
+        let parent = gate(1, "P", None, GateShape::Rect { x_min: 0.0, x_max: 5.0, y_min: -1.0, y_max: 1.0 });
+        let child = gate(2, "C", Some(1), GateShape::Rect { x_min: 0.0, x_max: 2.5, y_min: -1.0, y_max: 1.0 });
+
+        let res = apply_gates(&[parent, child], &events, &params, 4).unwrap();
+        // Parent: x≤5 → 3 of 4. Child: x≤2.5 ∧ parent → 2.
+        assert_eq!(res[0].n_in, 3);
+        assert_eq!(res[0].n_parent, 4);
+        assert_eq!(res[1].n_in, 2);
+        assert_eq!(res[1].n_parent, 3);
+        assert!((res[1].pct_parent() - 100.0 * 2.0 / 3.0).abs() < 1e-9);
+        assert!((res[1].pct_total() - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn gate_membership_unknown_channel_errors() {
+        let params = vec![param(1, "X"), param(2, "Y")];
+        let events = vec![1.0, 2.0];
+        let mut g = gate(1, "g", None, GateShape::Rect { x_min: 0.0, x_max: 1.0, y_min: 0.0, y_max: 1.0 });
+        g.x_channel = "NOPE".to_string();
+        assert!(gate_membership(&g, &events, &params, 1, 2).is_err());
+    }
+
+    #[test]
+    fn gate_result_zero_denominator_guards() {
+        let r = GateResult { name: "x".into(), n_in: 0, n_parent: 0, n_total: 0 };
+        assert_eq!(r.pct_parent(), 0.0);
+        assert_eq!(r.pct_total(), 0.0);
+    }
+}
