@@ -1,9 +1,14 @@
-# flowcyto
+<p align="center">
+  <img src="packaging/icon.png" alt="flowcyto logo" width="160">
+</p>
 
-A fast, native **macOS app (and CLI)** for analyzing BD flow-cytometry `.fcs`
-files — compensation, Linear/Log/Asinh/Logicle transforms, hierarchical gating,
-per-population statistics, and multi-sample batch export. Every numeric layer is
-cross-validated against R/[flowCore](https://bioconductor.org/packages/flowCore/).
+<h1 align="center">flowcyto</h1>
+
+A fast, native **macOS &amp; Windows app (and CLI)** for analyzing BD
+flow-cytometry `.fcs` files — compensation, Linear/Log/Asinh/Logicle transforms,
+hierarchical gating, per-population statistics, and multi-sample batch export.
+Every numeric layer is cross-validated against
+R/[flowCore](https://bioconductor.org/packages/flowCore/).
 
 ## Install
 
@@ -92,5 +97,11 @@ Requires the Rust toolchain.
 ```bash
 cargo build --release          # binary at target/release/flowcyto
 cargo test --release           # 88 tests
-./packaging/make-macos-app.sh  # build the .app + .dmg
+./packaging/make-macos-app.sh  # macOS: build the .app + .dmg
 ```
+
+The installers are also built by CI: pushing a `vX.Y.Z` tag runs the
+[macOS](.github/workflows/macos-installer.yml) and
+[Windows](.github/workflows/windows-installer.yml) workflows, which build the
+`.dmg` (on a Mac runner) and the Inno Setup `.exe` (on a Windows runner) and
+attach both to the GitHub release.
