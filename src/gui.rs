@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::Arc;
 
 use egui::{Color32, RichText, Stroke};
 use egui_plot::{
@@ -14,7 +17,10 @@ use crate::compensation::{
 use crate::fcs_write;
 use crate::fcs::FcsFile;
 use crate::gating::{effective_mask, gate_membership, Gate, GateShape};
-use crate::popstats::{append_long_csv, population_stats, PopulationStatsTable, LONG_CSV_HEADER};
+use crate::popstats::{
+    append_long_csv, append_long_csv_grouped, population_stats, PopulationStatsTable,
+    LONG_CSV_HEADER, LONG_CSV_HEADER_GROUPED,
+};
 use crate::transform::{AxisTransform, CompiledTransform};
 
 const MAX_SCATTER: usize = 20_000;
@@ -32,8 +38,26 @@ fn fmt_count(n: usize) -> String {
 
 // ── Colors ────────────────────────────────────────────────────────────────
 
-fn density_color(bucket: usize, n: usize, dark: bool) -> Color32 {
+/// Density-scatter colormap. Jet is the legacy rainbow; Viridis is the
+/// perceptually-uniform, colorblind-safe default preferred for publication.
+#[derive(Clone, Copy, PartialEq)]
+enum ColorMap { Viridis, Jet }
+
+impl ColorMap {
+    fn label(self) -> &'static str {
+        match self { ColorMap::Viridis => "Viridis", ColorMap::Jet => "Jet" }
+    }
+}
+
+fn density_color(bucket: usize, n: usize, dark: bool, cmap: ColorMap) -> Color32 {
     let t = bucket as f32 / (n.saturating_sub(1).max(1)) as f32;
+    match cmap {
+        ColorMap::Jet => jet_color(t, dark),
+        ColorMap::Viridis => viridis_color(t),
+    }
+}
+
+fn jet_color(t: f32, dark: bool) -> Color32 {
     let (r, g, b) = if t < 0.25 {
         let s = t / 0.25; (0.0, s, 1.0)
     } else if t < 0.5 {
@@ -54,6 +78,29 @@ fn density_color(bucket: usize, n: usize, dark: bool) -> Color32 {
     )
 }
 
+/// Viridis via piecewise-linear interpolation over 5 reference anchors.
+/// Reads well on both light and dark backgrounds (no floor lift needed).
+fn viridis_color(t: f32) -> Color32 {
+    const A: [(f32, f32, f32); 5] = [
+        (68.0, 1.0, 84.0),     // 0.00  deep purple
+        (59.0, 82.0, 139.0),   // 0.25  blue
+        (33.0, 144.0, 140.0),  // 0.50  teal
+        (93.0, 201.0, 99.0),   // 0.75  green
+        (253.0, 231.0, 37.0),  // 1.00  yellow
+    ];
+    let t = t.clamp(0.0, 1.0) * 4.0;
+    let i = (t.floor() as usize).min(3);
+    let f = t - i as f32;
+    let (r0, g0, b0) = A[i];
+    let (r1, g1, b1) = A[i + 1];
+    Color32::from_rgba_unmultiplied(
+        (r0 + (r1 - r0) * f) as u8,
+        (g0 + (g1 - g0) * f) as u8,
+        (b0 + (b1 - b0) * f) as u8,
+        220,
+    )
+}
+
 /// Heat tint for a spillover-matrix cell: neutral gray on the diagonal,
 /// orange→red proportional to spillover magnitude off-diagonal (saturating at ~25%).
 fn spill_cell_color(v: f64, is_diag: bool, dark: bool) -> Color32 {
@@ -65,13 +112,16 @@ fn spill_cell_color(v: f64, is_diag: bool, dark: bool) -> Color32 {
     Color32::from_rgba_unmultiplied(230, 90, 40, (a * 210.0) as u8)
 }
 
-fn gate_color(idx: usize) -> (Color32, Color32) {
+/// Stable color for a gate, keyed by its (immutable) `id` so a population keeps
+/// its color across deletes/reorders — not by list position, which would
+/// reshuffle every other gate's color whenever one is removed.
+fn gate_color(id: u32) -> (Color32, Color32) {
     const BASES: [(u8, u8, u8); 8] = [
         (220, 40, 40), (30, 160, 30), (40, 90, 230),
         (210, 130, 0), (170, 0, 170), (0, 150, 160),
         (230, 90, 0), (120, 0, 220),
     ];
-    let (r, g, b) = BASES[idx % 8];
+    let (r, g, b) = BASES[(id as usize) % 8];
     (Color32::from_rgb(r, g, b), Color32::from_rgba_unmultiplied(r, g, b, 26))
 }
 
@@ -82,6 +132,17 @@ enum DrawMode { Navigate, Rect, Ellipse, Polygon, Quadrant, Edit }
 
 #[derive(PartialEq, Clone, Copy)]
 enum ActiveTab { Plot, Histogram, Stats, Batch, Spillover }
+
+/// Cached density buckets for one cell of the 2×2 grid view.
+struct GridCell {
+    xi: usize,
+    yi: usize,
+    x_label: String,
+    y_label: String,
+    pop: Option<u32>,               // active "gate from here" population this was built for
+    gen: u64,                       // data generation this was built for
+    buckets: Vec<Vec<[f64; 2]>>,
+}
 
 struct ScatterCache {
     buckets: Vec<Vec<[f64; 2]>>,
@@ -95,10 +156,33 @@ struct ScatterCache {
 }
 
 /// A user-supplied / edited spillover matrix that overrides the embedded one.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct SpillOverride {
     channels: Vec<String>,
     rows: Vec<Vec<f64>>,
+}
+
+/// A saved analysis session — enough to reopen the workspace and resume.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Session {
+    sample_paths: Vec<PathBuf>,
+    #[serde(default)]
+    groups: Vec<String>,
+    #[serde(default)]
+    active_sample: usize,
+    do_compensate: bool,
+    #[serde(default)]
+    dark_mode: bool,
+    #[serde(default)]
+    viridis: bool,
+    channel_tf: Vec<AxisTransform>,
+    x_ch: usize,
+    y_ch: usize,
+    #[serde(default)]
+    hist_ch: usize,
+    gates: Vec<Gate>,
+    #[serde(default)]
+    spill_override: Option<SpillOverride>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -129,6 +213,7 @@ struct SampleRef {
     path: PathBuf,
     name: String,
     n_events: Option<usize>, // from a lightweight $TOT read, for QC display
+    group: String,           // user condition/group tag, carried into the batch CSV
 }
 
 /// Cached points of a reference sample overlaid behind the active scatter.
@@ -143,8 +228,16 @@ struct RefScatter {
 
 /// Result of a streamed batch run — per-sample population stat tables + skips.
 struct BatchResult {
-    tables: Vec<(String, PopulationStatsTable)>,
+    tables: Vec<(String, String, PopulationStatsTable)>, // (group, sample, table)
     skipped: Vec<(String, String)>, // (sample, reason)
+}
+
+/// Messages streamed from the background batch worker to the UI thread.
+enum BatchMsg {
+    Progress { done: usize, total: usize, name: String },
+    Table(String, String, PopulationStatsTable), // (group, sample, table)
+    Skip(String, String),                        // (sample, reason)
+    Done,
 }
 
 pub struct FlowCytoApp {
@@ -157,11 +250,19 @@ pub struct FlowCytoApp {
     active_sample: usize,
     batch: Option<BatchResult>,
     batch_channel: usize,            // channel index whose MFI shows in the batch table
+    batch_rx: Option<Receiver<BatchMsg>>,        // streamed results from the worker thread
+    batch_cancel: Option<Arc<AtomicBool>>,       // set to stop the worker early
+    batch_progress: Option<(usize, usize)>,      // (done, total) while a batch runs
     ref_sample: Option<usize>,       // reference sample overlaid behind the active scatter
     ref_scatter: Option<RefScatter>,
 
     do_compensate: bool,
     dark_mode: bool,
+    colormap: ColorMap,
+    cursor_label: Option<String>, // live data-coords readout under the plot cursor
+    last_plot_rect: Option<egui::Rect>, // screen rect of the most recent plot (for PNG crop)
+    screenshot_pending: bool,           // a "Save plot PNG" request is awaiting the captured frame
+    screenshot_sent: bool,              // the viewport screenshot command has been dispatched
 
     /// When Some, this matrix replaces the embedded $SPILLOVER everywhere.
     spill_override: Option<SpillOverride>,
@@ -179,8 +280,15 @@ pub struct FlowCytoApp {
     y_hi: f64,
 
     scatter: Option<ScatterCache>,
+    grid_mode: bool,                  // Plot tab: show a 2×2 grid of plots
+    grid_channels: Vec<(usize, usize)>, // per-cell (x, y) channel indices
+    grid_cache: Vec<Option<GridCell>>,  // per-cell density-bucket cache
+    active_grid_cell: Option<usize>,    // cell index owning the in-progress draw gesture
+    data_gen: u64,                    // bumped whenever compensated data changes
 
     gates: Vec<Gate>,
+    undo_stack: Vec<Vec<Gate>>, // gate-tree snapshots for undo (pre-mutation states)
+    redo_stack: Vec<Vec<Gate>>,
     next_gate_id: u32,
     gate_counts: HashMap<u32, (usize, usize)>, // id → (n_in_effective, n_parent)
     new_gate_parent: Option<u32>,
@@ -194,10 +302,12 @@ pub struct FlowCytoApp {
     backgate: bool,               // show the active population's PARENT events greyed behind it
     show_contours: bool,          // overlay iso-density contour lines (Plot tab)
     grab_handle: Option<usize>,   // which handle of the selected gate is being dragged (Edit mode)
+    gate_move_last: Option<[f64; 2]>, // last cursor pos (gate-display coords) while dragging a gate body
 
     pop_stats: Option<PopulationStatsTable>, // cached per-population table (Stats tab)
 
     // Histogram tab state
+    hist_ch: usize,                    // channel histogrammed (independent of the Plot X axis)
     hist_norm: HistNorm,
     hist_mode: HistMode,               // overlay populations (1 sample) or samples
     hist_sample_pop: Option<u32>,      // in Samples mode: which population to histogram (None = all)
@@ -219,14 +329,25 @@ impl Default for FlowCytoApp {
         FlowCytoApp {
             fcs: None, file_path: None, compensated: Vec::new(),
             samples: Vec::new(), active_sample: 0, batch: None, batch_channel: 0,
+            batch_rx: None, batch_cancel: None, batch_progress: None,
             ref_sample: None, ref_scatter: None,
             do_compensate: false, dark_mode: true,
+            colormap: ColorMap::Viridis,
+            cursor_label: None,
+            last_plot_rect: None,
+            screenshot_pending: false,
+            screenshot_sent: false,
             spill_override: None,
             channel_tf: Vec::new(), x_ch: 0, y_ch: 1,
             x_manual: false, x_lo: 0.0, x_hi: 262144.0,
             y_manual: false, y_lo: 0.0, y_hi: 262144.0,
             scatter: None,
-            gates: Vec::new(), next_gate_id: 1,
+            grid_mode: false,
+            grid_channels: vec![(0, 1), (0, 2), (0, 3), (1, 2)],
+            grid_cache: vec![None, None, None, None],
+            active_grid_cell: None,
+            data_gen: 0,
+            gates: Vec::new(), undo_stack: Vec::new(), redo_stack: Vec::new(), next_gate_id: 1,
             gate_counts: HashMap::new(), new_gate_parent: None,
             draw_mode: DrawMode::Navigate,
             drag_start: None, drag_current: None, poly_vertices: Vec::new(),
@@ -235,7 +356,9 @@ impl Default for FlowCytoApp {
             backgate: false,
             show_contours: false,
             grab_handle: None,
+            gate_move_last: None,
             pop_stats: None,
+            hist_ch: 0,
             hist_norm: HistNorm::Modal,
             hist_mode: HistMode::Populations,
             hist_sample_pop: None,
@@ -266,7 +389,7 @@ impl FlowCytoApp {
             let name = p.file_stem().map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| "sample".into());
             let n_events = FcsFile::peek_events(&p).ok();
-            self.samples.push(SampleRef { path: p, name, n_events });
+            self.samples.push(SampleRef { path: p, name, n_events, group: String::new() });
         }
         self.batch = None;
         if was_empty && !self.samples.is_empty() {
@@ -332,18 +455,7 @@ impl FlowCytoApp {
     /// matrix exists but fails to build/invert/apply — so callers never silently
     /// pass off raw data as "compensated".
     fn compensate_events(&self, fcs: &FcsFile) -> Result<Vec<f64>, String> {
-        if !self.do_compensate {
-            return Ok(fcs.events.clone());
-        }
-        if let Some(ov) = &self.spill_override {
-            return SpilloverMatrix::from_parts(ov.channels.clone(), &ov.rows)
-                .and_then(|s| s.apply(fcs)).map_err(|e| e.to_string());
-        }
-        if let Some(kw) = fcs.spillover_keyword() {
-            return SpilloverMatrix::from_keyword(kw)
-                .and_then(|s| s.apply(fcs)).map_err(|e| e.to_string());
-        }
-        Ok(fcs.events.clone()) // no matrix present → uncompensated (legitimate)
+        compensate_for(fcs, self.do_compensate, self.spill_override.as_ref())
     }
 
     fn reprocess(&mut self) {
@@ -358,6 +470,7 @@ impl FlowCytoApp {
         self.pop_stats = None; // data changed → population stats stale
         self.hist_cache = None;
         self.ref_scatter = None; // compensation changed → reference overlay stale
+        self.data_gen = self.data_gen.wrapping_add(1); // invalidate grid caches
     }
 
     fn cur_tf(&self, ch: usize) -> AxisTransform {
@@ -433,6 +546,67 @@ impl FlowCytoApp {
             back_pts,
             contours,
         });
+    }
+
+    /// Density buckets for an arbitrary channel pair (grid cells). Respects the
+    /// active "gate from here" population, same as the main scatter.
+    fn compute_cell_buckets(&self, xi: usize, yi: usize) -> Vec<Vec<[f64; 2]>> {
+        let (n_events, n_params) = match &self.fcs {
+            Some(f) => (f.n_events, f.n_params()), None => return Vec::new(),
+        };
+        if n_events == 0 || n_params == 0 || self.compensated.len() < n_events * n_params {
+            return Vec::new();
+        }
+        let xi = xi.min(n_params - 1);
+        let yi = yi.min(n_params - 1);
+        let xt = self.cur_tf(xi).compile();
+        let yt = self.cur_tf(yi).compile();
+        let kept: Vec<usize> = match self.active_pop.map(|p| self.pop_mask(p)) {
+            Some(m) => (0..n_events).filter(|&e| m.get(e).copied().unwrap_or(false)).collect(),
+            None => (0..n_events).collect(),
+        };
+        let dx: Vec<f64> = kept.iter().map(|&e| xt.forward(self.compensated[e * n_params + xi])).collect();
+        let dy: Vec<f64> = kept.iter().map(|&e| yt.forward(self.compensated[e * n_params + yi])).collect();
+        bucketize(&dx, &dy)
+    }
+
+    /// The gate drawn on channels (x_base, y_base) whose shape contains the plot
+    /// point `p` (in the plot's display coords). Prefers the deepest (most specific)
+    /// matching gate, so double-clicking nested gates drills to the innermost.
+    fn gate_at_point(&self, x_base: &str, y_base: &str, xt: &CompiledTransform, yt: &CompiledTransform, p: [f64; 2]) -> Option<u32> {
+        let depths: HashMap<u32, usize> = crate::gating::gate_tree_order(&self.gates).into_iter().collect();
+        let mut best: Option<(u32, usize)> = None;
+        for g in &self.gates {
+            if g.x_channel.eq_ignore_ascii_case(x_base) && g.y_channel.eq_ignore_ascii_case(y_base) {
+                let gxt = g.x_transform.compile();
+                let gyt = g.y_transform.compile();
+                let gx = gxt.forward(xt.inverse(p[0]));
+                let gy = gyt.forward(yt.inverse(p[1]));
+                if g.shape.contains(gx, gy) {
+                    let d = depths.get(&g.id).copied().unwrap_or(0);
+                    if best.map(|(_, bd)| d > bd).unwrap_or(true) { best = Some((g.id, d)); }
+                }
+            }
+        }
+        best.map(|(id, _)| id)
+    }
+
+    /// Drill into the gate under a double-clicked point ("gate from here"). Returns
+    /// true if a gate was hit.
+    fn drill_at(&mut self, x_name: &str, y_name: &str, xt: &CompiledTransform, yt: &CompiledTransform, p: [f64; 2]) -> bool {
+        match self.gate_at_point(&x_name_base(x_name), &x_name_base(y_name), xt, yt, p) {
+            Some(id) => {
+                self.active_pop = Some(id);
+                self.new_gate_parent = Some(id);
+                self.selected_gate = Some(id);
+                self.scatter = None;
+                if let Some(g) = self.gates.iter().find(|g| g.id == id) {
+                    self.status = format!("Gating from “{}” (double-click a child to go deeper)", g.name);
+                }
+                true
+            }
+            None => false,
+        }
     }
 
     /// Ancestor path (root → `pop`) as (id, name), for the gate-from-here breadcrumb.
@@ -531,15 +705,75 @@ impl FlowCytoApp {
         self.gate_counts = counts;
         self.pop_stats = None; // gates changed → population stats stale
         self.hist_cache = None;
-        if self.active_pop.is_some() { self.scatter = None; } // filtered view depends on masks
+        if self.active_pop.is_some() {
+            self.scatter = None; // filtered view depends on masks
+            self.data_gen = self.data_gen.wrapping_add(1); // grid cells depend on masks too
+        }
+    }
+
+    // ── Undo / redo (gate-tree snapshots) ─────────────────────────────
+
+    /// Snapshot the current gate tree before a mutation. Clears the redo stack.
+    fn push_undo(&mut self) {
+        let snap = self.gates.clone();
+        self.push_undo_state(snap);
+    }
+
+    /// Push an explicit pre-mutation snapshot (used when the snapshot must be
+    /// taken before an in-place widget edit). Clears the redo stack.
+    fn push_undo_state(&mut self, snap: Vec<Gate>) {
+        const MAX: usize = 100;
+        self.undo_stack.push(snap);
+        if self.undo_stack.len() > MAX { self.undo_stack.remove(0); }
+        self.redo_stack.clear();
+    }
+
+    fn undo(&mut self) {
+        if let Some(prev) = self.undo_stack.pop() {
+            self.redo_stack.push(std::mem::replace(&mut self.gates, prev));
+            self.after_gate_restore("Undo");
+        } else {
+            self.status = "Nothing to undo.".into();
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(next) = self.redo_stack.pop() {
+            self.undo_stack.push(std::mem::replace(&mut self.gates, next));
+            self.after_gate_restore("Redo");
+        } else {
+            self.status = "Nothing to redo.".into();
+        }
+    }
+
+    /// Re-derive ids/selections and mark caches stale after restoring a snapshot.
+    fn after_gate_restore(&mut self, what: &str) {
+        self.next_gate_id = self.gates.iter().map(|g| g.id).max().unwrap_or(0) + 1;
+        if let Some(s) = self.selected_gate { if !self.gates.iter().any(|g| g.id == s) { self.selected_gate = None; } }
+        if let Some(p) = self.new_gate_parent { if !self.gates.iter().any(|g| g.id == p) { self.new_gate_parent = None; } }
+        if let Some(a) = self.active_pop { if !self.gates.iter().any(|g| g.id == a) { self.active_pop = None; } }
+        if let Some(h) = self.hist_sample_pop { if !self.gates.iter().any(|g| g.id == h) { self.hist_sample_pop = None; } }
+        self.hist_hidden.retain(|id| self.gates.iter().any(|g| g.id == *id));
+        self.scatter = None;
+        self.hist_cache = None;
+        self.needs_regate = true;
+        self.status = format!("{} ({} undo / {} redo)", what, self.undo_stack.len(), self.redo_stack.len());
     }
 
     fn commit_gate(&mut self, shape: GateShape) {
+        self.commit_gate_on(self.x_ch, self.y_ch, shape);
+    }
+
+    /// Commit a 2-D gate on an explicit channel pair (used by grid cells, which
+    /// each have their own X/Y independent of the single-plot axes).
+    fn commit_gate_on(&mut self, xi: usize, yi: usize, shape: GateShape) {
+        if self.fcs.is_none() { return; }
+        self.push_undo();
         let fcs = match &self.fcs { Some(f) => f, None => return };
         let n = fcs.n_params();
         if n == 0 { return; }
-        let xi = self.x_ch.min(n - 1);
-        let yi = self.y_ch.min(n - 1);
+        let xi = xi.min(n - 1);
+        let yi = yi.min(n - 1);
         let id = self.next_gate_id;
         self.next_gate_id += 1;
 
@@ -552,6 +786,7 @@ impl FlowCytoApp {
             x_transform: self.cur_tf(xi),
             y_transform: self.cur_tf(yi),
             shape,
+            quad_group: None,
         };
         self.gates.push(gate);
         self.needs_regate = true;
@@ -561,11 +796,17 @@ impl FlowCytoApp {
     /// Commit a quadrant gate: 4 rectangle populations split at (cx, cy) in display
     /// coords on the current X/Y channels — the natural tool for e.g. CD103×CD11b.
     fn commit_quadrant(&mut self, cx: f64, cy: f64) {
+        self.commit_quadrant_on(self.x_ch, self.y_ch, cx, cy);
+    }
+
+    fn commit_quadrant_on(&mut self, xi: usize, yi: usize, cx: f64, cy: f64) {
+        if self.fcs.is_none() { return; }
+        self.push_undo();
         let fcs = match &self.fcs { Some(f) => f, None => return };
         let n = fcs.n_params();
         if n == 0 { return; }
-        let xi = self.x_ch.min(n - 1);
-        let yi = self.y_ch.min(n - 1);
+        let xi = xi.min(n - 1);
+        let yi = yi.min(n - 1);
         let xn = fcs.parameters[xi].name.clone();
         let yn = fcs.parameters[yi].name.clone();
         let (xt, yt) = (self.cur_tf(xi), self.cur_tf(yi));
@@ -580,6 +821,7 @@ impl FlowCytoApp {
             (format!("{}+ {}-", xs, ys), (cx, BIG), (-BIG, cy)),
         ];
         let parent = self.new_gate_parent;
+        let group = self.next_gate_id; // the first member's id doubles as the group id
         for (name, (x0, x1), (y0, y1)) in quads {
             let id = self.next_gate_id;
             self.next_gate_id += 1;
@@ -588,18 +830,21 @@ impl FlowCytoApp {
                 x_channel: xn.clone(), y_channel: yn.clone(),
                 x_transform: xt.clone(), y_transform: yt.clone(),
                 shape: GateShape::Rect { x_min: x0, x_max: x1, y_min: y0, y_max: y1 },
+                quad_group: Some(group),
             });
         }
         self.needs_regate = true;
-        self.status = format!("Added quadrant on {}×{}", xs, ys);
+        self.status = format!("Added linked quadrant on {}×{}", xs, ys);
     }
 
     /// Commit a 1-D interval gate on the current X channel (drawn on a histogram).
     fn commit_range_gate(&mut self, x_min: f64, x_max: f64) {
+        if self.fcs.is_none() { return; }
+        self.push_undo();
         let fcs = match &self.fcs { Some(f) => f, None => return };
         let n = fcs.n_params();
         if n == 0 { return; }
-        let xi = self.x_ch.min(n - 1);
+        let xi = self.hist_ch.min(n - 1);
         let id = self.next_gate_id;
         self.next_gate_id += 1;
         let ch = fcs.parameters[xi].name.clone();
@@ -613,11 +858,30 @@ impl FlowCytoApp {
             x_transform: tf.clone(),
             y_transform: tf,
             shape: GateShape::Range { x_min: x_min.min(x_max), x_max: x_min.max(x_max) },
+            quad_group: None,
         };
         self.gates.push(gate);
         self.needs_regate = true;
         self.hist_cache = None;
         self.status = format!("Added interval gate {}", id);
+    }
+
+    /// Finish the in-progress polygon, committing it to the right channel pair —
+    /// the active grid cell's channels in grid mode, else the single-plot axes.
+    fn finish_polygon(&mut self) {
+        let verts = std::mem::take(&mut self.poly_vertices);
+        if verts.len() >= 3 {
+            if self.grid_mode {
+                if let Some(c) = self.active_grid_cell {
+                    let (xi, yi) = self.grid_channels.get(c).copied().unwrap_or((self.x_ch, self.y_ch));
+                    self.commit_gate_on(xi, yi, GateShape::Polygon { vertices: verts });
+                }
+            } else {
+                self.commit_gate(GateShape::Polygon { vertices: verts });
+            }
+        }
+        self.draw_mode = DrawMode::Navigate;
+        self.active_grid_cell = None;
     }
 
     /// Build per-population binned histogram of the current X channel (display space).
@@ -628,7 +892,7 @@ impl FlowCytoApp {
         if n_events == 0 || n_params == 0 || self.compensated.len() < n_events * n_params {
             return;
         }
-        let xi = self.x_ch.min(n_params - 1);
+        let xi = self.hist_ch.min(n_params - 1);
         let xt = self.cur_tf(xi).compile();
         let norm = self.hist_norm;
         let x_name = self.fcs.as_ref().map(|f| f.parameters[xi].name.clone()).unwrap_or_default();
@@ -706,14 +970,14 @@ impl FlowCytoApp {
                 for &x in &dx { c[binof(x)] += 1.0; }
                 series.push(HistSeries { name: "All events".into(), color: Color32::GRAY, values: normalize_hist(c, norm) });
             }
-            for (idx, g) in self.gates.iter().enumerate() {
+            for g in self.gates.iter() {
                 if self.hist_hidden.contains(&g.id) { continue; }
                 let eff = effective_mask(g.id, &by_id, &own, n_events);
                 let mut c = vec![0.0; B];
                 for e in 0..n_events {
                     if eff[e] { c[binof(dx[e])] += 1.0; }
                 }
-                series.push(HistSeries { name: g.name.clone(), color: gate_color(idx).0, values: normalize_hist(c, norm) });
+                series.push(HistSeries { name: g.name.clone(), color: gate_color(g.id).0, values: normalize_hist(c, norm) });
             }
             (centers, series)
         };
@@ -750,16 +1014,79 @@ impl eframe::App for FlowCytoApp {
             ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
         }
 
+        self.poll_batch(ctx);
+        self.handle_keys(ctx);
+
         self.panel_top(ctx);
         self.panel_left(ctx);
         self.panel_status(ctx);
         self.panel_central(ctx);
+
+        self.poll_screenshot(ctx);
     }
 }
 
 // ── UI panels ─────────────────────────────────────────────────────────────
 
 impl FlowCytoApp {
+    /// Keyboard shortcuts. Skipped while a text field has focus so typing names
+    /// or numbers is never hijacked.
+    fn handle_keys(&mut self, ctx: &egui::Context) {
+        if ctx.wants_keyboard_input() { return; }
+        use egui::Key;
+        struct Keys {
+            undo: bool, redo: bool, save: bool, esc: bool,
+            rect: bool, ellipse: bool, poly: bool, quad: bool, edit: bool, nav: bool,
+            tabs: [bool; 5],
+        }
+        let k = ctx.input(|i| {
+            let cmd = i.modifiers.command;
+            let plain = !cmd && !i.modifiers.shift && !i.modifiers.alt;
+            Keys {
+                undo: cmd && !i.modifiers.shift && i.key_pressed(Key::Z),
+                redo: cmd && i.modifiers.shift && i.key_pressed(Key::Z),
+                save: cmd && i.key_pressed(Key::S),
+                esc: i.key_pressed(Key::Escape),
+                rect: plain && i.key_pressed(Key::R),
+                ellipse: plain && i.key_pressed(Key::E),
+                poly: plain && i.key_pressed(Key::P),
+                quad: plain && i.key_pressed(Key::Q),
+                edit: plain && i.key_pressed(Key::G),
+                nav: plain && i.key_pressed(Key::V),
+                tabs: [
+                    plain && i.key_pressed(Key::Num1), plain && i.key_pressed(Key::Num2),
+                    plain && i.key_pressed(Key::Num3), plain && i.key_pressed(Key::Num4),
+                    plain && i.key_pressed(Key::Num5),
+                ],
+            }
+        });
+
+        if k.save { self.save_gates(); }
+        if k.undo { self.undo(); }
+        if k.redo { self.redo(); }
+
+        let set_mode = |app: &mut Self, m: DrawMode| {
+            app.draw_mode = if app.draw_mode == m { DrawMode::Navigate } else { m };
+            app.drag_start = None; app.drag_current = None; app.poly_vertices.clear();
+        };
+        if k.rect { set_mode(self, DrawMode::Rect); }
+        if k.ellipse { set_mode(self, DrawMode::Ellipse); }
+        if k.poly { set_mode(self, DrawMode::Polygon); }
+        if k.quad { set_mode(self, DrawMode::Quadrant); }
+        if k.edit { set_mode(self, DrawMode::Edit); }
+        if k.nav || k.esc {
+            self.draw_mode = DrawMode::Navigate;
+            self.drag_start = None; self.drag_current = None; self.poly_vertices.clear();
+        }
+
+        const TAB_ORDER: [ActiveTab; 5] = [
+            ActiveTab::Plot, ActiveTab::Histogram, ActiveTab::Stats, ActiveTab::Batch, ActiveTab::Spillover,
+        ];
+        for (t, &on) in TAB_ORDER.iter().zip(k.tabs.iter()) {
+            if on { self.active_tab = *t; }
+        }
+    }
+
     fn panel_top(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -770,6 +1097,10 @@ impl FlowCytoApp {
                         self.add_files(paths);
                     }
                 }
+                if ui.button("🖫 Save session").on_hover_text("Save workspace + gates + transforms + compensation").clicked() {
+                    self.save_session();
+                }
+                if ui.button("📜 Load session").clicked() { self.load_session(); }
                 ui.separator();
                 if ui.checkbox(&mut self.do_compensate, "Compensate").changed() {
                     self.needs_reprocess = true;
@@ -852,6 +1183,21 @@ impl FlowCytoApp {
         });
         tf_changed |= self.ui_transform_combo(ui, "ytf", self.y_ch);
 
+        // Apply the X channel's transform to every fluorescence channel at once —
+        // saves setting Logicle/asinh one-by-one across a big panel.
+        if ui.add(egui::Button::new(RichText::new("⇊ X scale → all fluorescence").small()))
+            .on_hover_text("Set every fluorescence channel's scale to match the current X channel")
+            .clicked()
+        {
+            let tf = self.cur_tf(self.x_ch);
+            if let Some(fcs) = &self.fcs {
+                for i in crate::transform::fluorescence_indices(&fcs.parameters) {
+                    if i < self.channel_tf.len() { self.channel_tf[i] = tf.clone(); }
+                }
+            }
+            tf_changed = true;
+        }
+
         ui.add_space(4.0);
         if let Some(p) = &self.file_path {
             ui.label(RichText::new(p.file_name().unwrap_or_default().to_string_lossy()).small());
@@ -899,6 +1245,26 @@ impl FlowCytoApp {
             }
         });
         changed
+    }
+
+    /// Compact per-axis scale picker for a grid cell. Edits the channel's shared
+    /// transform (same one the left panel uses), so it updates everywhere.
+    fn grid_axis_scale(&mut self, ui: &mut egui::Ui, id: &str, ch: usize) {
+        let cur = self.cur_tf(ch);
+        egui::ComboBox::from_id_salt(id).selected_text(cur.short_label()).width(74.0).show_ui(ui, |ui| {
+            let opts = [
+                ("Linear", AxisTransform::Linear),
+                ("Log", AxisTransform::default_log()),
+                ("Asinh", AxisTransform::Asinh { cofactor: 150.0 }),
+                ("Logicle", AxisTransform::default_logicle()),
+            ];
+            for (lbl, tf) in opts {
+                let selected = cur.short_label() == lbl;
+                if ui.selectable_label(selected, lbl).clicked() && !selected && ch < self.channel_tf.len() {
+                    self.channel_tf[ch] = tf;
+                }
+            }
+        });
     }
 
     fn ui_axis_limits(&mut self, ui: &mut egui::Ui) {
@@ -953,21 +1319,22 @@ impl FlowCytoApp {
             self.draw_btn(ui, DrawMode::Quadrant, "✛ Quad");
             self.draw_btn(ui, DrawMode::Edit, "✎ Edit");
         });
+        ui.label(RichText::new("keys: R/E/P/Q draw · G edit · V/Esc nav · ⌘Z undo")
+            .small().color(Color32::GRAY))
+            .on_hover_text("1–5 switch tabs · ⌘S save gates · ⌘⇧Z redo");
         if self.draw_mode != DrawMode::Navigate {
             ui.horizontal(|ui| {
                 let hint = match self.draw_mode {
                     DrawMode::Polygon => "click to add points",
                     DrawMode::Quadrant => "click to set the quadrant center",
-                    DrawMode::Edit => "select a gate (■), then drag its handles",
+                    DrawMode::Edit => "select a gate (■): drag handles to resize, body to move, outer handle to rotate",
                     _ => "drag on plot",
                 };
                 ui.label(RichText::new(format!("✏ {}", hint)).color(Color32::from_rgb(220, 170, 0)).small());
                 if self.draw_mode == DrawMode::Polygon && self.poly_vertices.len() >= 3
                     && ui.small_button("Finish").clicked()
                 {
-                    let verts = std::mem::take(&mut self.poly_vertices);
-                    self.commit_gate(GateShape::Polygon { vertices: verts });
-                    self.draw_mode = DrawMode::Navigate;
+                    self.finish_polygon();
                 }
                 if ui.small_button("Cancel").clicked() {
                     self.draw_mode = DrawMode::Navigate;
@@ -991,6 +1358,14 @@ impl FlowCytoApp {
             });
         });
 
+        // Undo / redo
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!self.undo_stack.is_empty(), egui::Button::new("↶ Undo"))
+                .on_hover_text("Undo gate change (Ctrl/Cmd+Z)").clicked() { self.undo(); }
+            if ui.add_enabled(!self.redo_stack.is_empty(), egui::Button::new("↷ Redo"))
+                .on_hover_text("Redo (Ctrl/Cmd+Shift+Z)").clicked() { self.redo(); }
+        });
+
         // Save / load
         ui.horizontal(|ui| {
             if ui.button("💾 Save").clicked() { self.save_gates(); }
@@ -1005,7 +1380,7 @@ impl FlowCytoApp {
         let mut reparent: Option<(u32, Option<u32>)> = None;
         for (gid, depth) in order {
             let idx = match self.gates.iter().position(|g| g.id == gid) { Some(i) => i, None => continue };
-            let (color, _) = gate_color(idx);
+            let (color, _) = gate_color(gid);
             let (n_in, n_parent) = self.gate_counts.get(&gid).copied().unwrap_or((0, 0));
             let pct_par = if n_parent > 0 { 100.0 * n_in as f64 / n_parent as f64 } else { 0.0 };
             let (name, shape_lbl, xch, ych) = {
@@ -1058,49 +1433,92 @@ impl FlowCytoApp {
 
             // Numeric inspector for the selected gate (bounds edited in DATA units).
             if self.selected_gate == Some(gid) {
+                // Snapshot the pre-edit tree so a drag on any field is undoable.
+                let before = self.gates.clone();
                 let xt = self.gates[idx].x_transform.compile();
                 let yt = self.gates[idx].y_transform.compile();
                 let ind = depth as f32 * 14.0 + 16.0;
-                let mut changed = false;
-                let row = |ui: &mut egui::Ui, lab: &str, disp: &mut f64, t: &CompiledTransform| -> bool {
-                    let mut v = t.inverse(*disp);
-                    let mut ch = false;
-                    ui.horizontal(|ui| {
-                        ui.add_space(ind);
-                        ui.label(RichText::new(lab).small());
-                        if ui.add(egui::DragValue::new(&mut v).speed(10.0)).changed() {
-                            *disp = t.forward(v); ch = true;
-                        }
-                    });
-                    ch
-                };
-                match &mut self.gates[idx].shape {
-                    GateShape::Rect { x_min, x_max, y_min, y_max } => {
-                        changed |= row(ui, "x min", x_min, &xt); changed |= row(ui, "x max", x_max, &xt);
-                        changed |= row(ui, "y min", y_min, &yt); changed |= row(ui, "y max", y_max, &yt);
-                    }
-                    GateShape::Range { x_min, x_max } => {
-                        changed |= row(ui, "min", x_min, &xt); changed |= row(ui, "max", x_max, &xt);
-                    }
-                    GateShape::Ellipse { cx, cy, rx, ry, .. } => {
-                        changed |= row(ui, "center x", cx, &xt); changed |= row(ui, "center y", cy, &yt);
-                        // radii are in display units; edit directly
-                        ui.horizontal(|ui| { ui.add_space(ind); ui.label(RichText::new("radius x (disp)").small());
-                            if ui.add(egui::DragValue::new(rx).speed(0.01)).changed() { changed = true; } });
-                        ui.horizontal(|ui| { ui.add_space(ind); ui.label(RichText::new("radius y (disp)").small());
-                            if ui.add(egui::DragValue::new(ry).speed(0.01)).changed() { changed = true; } });
-                    }
-                    GateShape::Polygon { .. } => {
+                let quad_group = self.gates[idx].quad_group;
+                if let Some(group) = quad_group {
+                    // Linked quadrant: one center editor drives all four rectangles.
+                    if let Some((cx, cy)) = self.quadrant_center(group) {
+                        let mut dx = xt.inverse(cx);
+                        let mut dy = yt.inverse(cy);
+                        let (mut q_changed, mut q_started) = (false, false);
+                        ui.horizontal(|ui| { ui.add_space(ind); ui.label(RichText::new("quad center x").small());
+                            let r = ui.add(egui::DragValue::new(&mut dx).speed(10.0));
+                            if r.drag_started() { q_started = true; }
+                            if r.changed() { q_changed = true; } });
+                        ui.horizontal(|ui| { ui.add_space(ind); ui.label(RichText::new("quad center y").small());
+                            let r = ui.add(egui::DragValue::new(&mut dy).speed(10.0));
+                            if r.drag_started() { q_started = true; }
+                            if r.changed() { q_changed = true; } });
                         ui.horizontal(|ui| { ui.add_space(ind);
-                            ui.label(RichText::new("polygon — redraw to change").small().color(Color32::GRAY)); });
+                            ui.label(RichText::new("linked quadrant — moves all 4").small().color(Color32::GRAY)); });
+                        if q_started { self.push_undo_state(before); }
+                        if q_changed {
+                            self.set_quadrant_center(group, xt.forward(dx), yt.forward(dy));
+                            self.needs_regate = true;
+                            if self.active_pop.is_some() { self.scatter = None; }
+                        }
                     }
+                } else {
+                    let mut changed = false;
+                    let mut started = false;
+                    // (changed, drag_started) for a DragValue editing a data-unit field.
+                    let row = |ui: &mut egui::Ui, lab: &str, disp: &mut f64, t: &CompiledTransform| -> (bool, bool) {
+                        let mut v = t.inverse(*disp);
+                        let (mut ch, mut st) = (false, false);
+                        ui.horizontal(|ui| {
+                            ui.add_space(ind);
+                            ui.label(RichText::new(lab).small());
+                            let resp = ui.add(egui::DragValue::new(&mut v).speed(10.0));
+                            if resp.drag_started() { st = true; }
+                            if resp.changed() { *disp = t.forward(v); ch = true; }
+                        });
+                        (ch, st)
+                    };
+                    macro_rules! apply { ($e:expr) => {{ let (c, s) = $e; changed |= c; started |= s; }} }
+                    match &mut self.gates[idx].shape {
+                        GateShape::Rect { x_min, x_max, y_min, y_max } => {
+                            apply!(row(ui, "x min", x_min, &xt)); apply!(row(ui, "x max", x_max, &xt));
+                            apply!(row(ui, "y min", y_min, &yt)); apply!(row(ui, "y max", y_max, &yt));
+                        }
+                        GateShape::Range { x_min, x_max } => {
+                            apply!(row(ui, "min", x_min, &xt)); apply!(row(ui, "max", x_max, &xt));
+                        }
+                        GateShape::Ellipse { cx, cy, rx, ry, angle } => {
+                            apply!(row(ui, "center x", cx, &xt)); apply!(row(ui, "center y", cy, &yt));
+                            // radii are in display units; edit directly
+                            ui.horizontal(|ui| { ui.add_space(ind); ui.label(RichText::new("radius x (disp)").small());
+                                let r = ui.add(egui::DragValue::new(rx).speed(0.01));
+                                if r.drag_started() { started = true; }
+                                if r.changed() { changed = true; } });
+                            ui.horizontal(|ui| { ui.add_space(ind); ui.label(RichText::new("radius y (disp)").small());
+                                let r = ui.add(egui::DragValue::new(ry).speed(0.01));
+                                if r.drag_started() { started = true; }
+                                if r.changed() { changed = true; } });
+                            // rotation in degrees (stored as radians)
+                            let mut deg = angle.to_degrees();
+                            ui.horizontal(|ui| { ui.add_space(ind); ui.label(RichText::new("rotation (°)").small());
+                                let r = ui.add(egui::DragValue::new(&mut deg).speed(1.0).range(-180.0..=180.0));
+                                if r.drag_started() { started = true; }
+                                if r.changed() { *angle = deg.to_radians(); changed = true; } });
+                        }
+                        GateShape::Polygon { .. } => {
+                            ui.horizontal(|ui| { ui.add_space(ind);
+                                ui.label(RichText::new("polygon — redraw to change").small().color(Color32::GRAY)); });
+                        }
+                    }
+                    if started { self.push_undo_state(before); }
+                    if changed { self.needs_regate = true; }
                 }
-                if changed { self.needs_regate = true; }
             }
             ui.separator();
         }
 
         if let Some(gid) = to_delete {
+            self.push_undo();
             // Re-parent children of the deleted gate to its parent (avoid orphans).
             let parent_of = self.gates.iter().find(|g| g.id == gid).and_then(|g| g.parent);
             for g in &mut self.gates {
@@ -1116,6 +1534,7 @@ impl FlowCytoApp {
         }
         if let Some((gid, new_parent)) = reparent {
             if !self.would_cycle(gid, new_parent) {
+                self.push_undo();
                 if let Some(g) = self.gates.iter_mut().find(|g| g.id == gid) { g.parent = new_parent; }
                 self.needs_regate = true;
             } else {
@@ -1130,6 +1549,35 @@ impl FlowCytoApp {
         if ui.selectable_label(active, txt).clicked() {
             self.draw_mode = if active { DrawMode::Navigate } else { mode };
             self.drag_start = None; self.drag_current = None; self.poly_vertices.clear();
+        }
+    }
+
+    /// Shared (display-coord) center of a quadrant group, read from any member.
+    fn quadrant_center(&self, group: u32) -> Option<(f64, f64)> {
+        const HALF: f64 = 5.0e11;
+        for g in &self.gates {
+            if g.quad_group == Some(group) {
+                if let GateShape::Rect { x_min, x_max, y_min, y_max } = &g.shape {
+                    let cx = if *x_min > -HALF { *x_min } else { *x_max };
+                    let cy = if *y_min > -HALF { *y_min } else { *y_max };
+                    return Some((cx, cy));
+                }
+            }
+        }
+        None
+    }
+
+    /// Move a whole quadrant group's shared center (display coords) — all four
+    /// rectangles update together.
+    fn set_quadrant_center(&mut self, group: u32, cx: f64, cy: f64) {
+        const HALF: f64 = 5.0e11;
+        for g in &mut self.gates {
+            if g.quad_group == Some(group) {
+                if let GateShape::Rect { x_min, x_max, y_min, y_max } = &mut g.shape {
+                    if *x_min > -HALF { *x_min = cx; } else if *x_max < HALF { *x_max = cx; }
+                    if *y_min > -HALF { *y_min = cy; } else if *y_max < HALF { *y_max = cy; }
+                }
+            }
         }
     }
 
@@ -1164,6 +1612,7 @@ impl FlowCytoApp {
                 .and_then(|s| serde_json::from_str::<Vec<Gate>>(&s).map_err(|e| e.to_string()))
             {
                 Ok(gates) => {
+                    self.push_undo();
                     self.next_gate_id = gates.iter().map(|g| g.id).max().unwrap_or(0) + 1;
                     self.gates = gates;
                     self.new_gate_parent = None;
@@ -1175,18 +1624,116 @@ impl FlowCytoApp {
         }
     }
 
+    // ── Session save / load ───────────────────────────────────────────
+
+    fn save_session(&mut self) {
+        if self.samples.is_empty() { self.status = "No workspace to save.".into(); return; }
+        let session = Session {
+            sample_paths: self.samples.iter().map(|s| s.path.clone()).collect(),
+            groups: self.samples.iter().map(|s| s.group.clone()).collect(),
+            active_sample: self.active_sample,
+            do_compensate: self.do_compensate,
+            dark_mode: self.dark_mode,
+            viridis: self.colormap == ColorMap::Viridis,
+            channel_tf: self.channel_tf.clone(),
+            x_ch: self.x_ch,
+            y_ch: self.y_ch,
+            hist_ch: self.hist_ch,
+            gates: self.gates.clone(),
+            spill_override: self.spill_override.clone(),
+        };
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("JSON", &["json"]).set_file_name("session.json").save_file()
+        {
+            match serde_json::to_string_pretty(&session).map_err(|e| e.to_string())
+                .and_then(|s| std::fs::write(&path, s).map_err(|e| e.to_string()))
+            {
+                Ok(_) => self.status = format!("Saved session ({} samples) → {}", self.samples.len(), path.display()),
+                Err(e) => self.status = format!("Session save error: {}", e),
+            }
+        }
+    }
+
+    fn load_session(&mut self) {
+        let path = match rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file() {
+            Some(p) => p, None => return,
+        };
+        let session: Session = match std::fs::read_to_string(&path).map_err(|e| e.to_string())
+            .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
+        {
+            Ok(s) => s,
+            Err(e) => { self.status = format!("Session load error: {}", e); return; }
+        };
+
+        // Reset the workspace, then reopen the saved files (sample 0 fresh).
+        self.samples.clear();
+        self.fcs = None; self.compensated.clear();
+        self.ref_sample = None; self.ref_scatter = None; self.batch = None;
+        self.undo_stack.clear(); self.redo_stack.clear();
+        // Keep (path, group) paired while dropping missing files, so tags stay
+        // aligned, and track how the active index shifts past dropped predecessors.
+        let mut surviving: Vec<(PathBuf, String)> = Vec::new();
+        let mut missing = 0usize;
+        let mut active_shift = 0usize; // survivors before the originally-active sample
+        for (i, p) in session.sample_paths.iter().enumerate() {
+            if p.exists() {
+                if i < session.active_sample { active_shift += 1; }
+                let g = session.groups.get(i).cloned().unwrap_or_default();
+                surviving.push((p.clone(), g));
+            } else {
+                missing += 1;
+            }
+        }
+        if surviving.is_empty() { self.status = "Session files not found on disk.".into(); return; }
+        let paths: Vec<PathBuf> = surviving.iter().map(|(p, _)| p.clone()).collect();
+        self.add_files(paths);
+
+        // Restore tags + analysis state.
+        for (s, (_, g)) in self.samples.iter_mut().zip(surviving.iter()) { s.group = g.clone(); }
+        self.do_compensate = session.do_compensate;
+        self.dark_mode = session.dark_mode;
+        self.colormap = if session.viridis { ColorMap::Viridis } else { ColorMap::Jet };
+        self.spill_override = session.spill_override;
+        self.gates = session.gates;
+        self.next_gate_id = self.gates.iter().map(|g| g.id).max().unwrap_or(0) + 1;
+
+        // Activate the saved sample (loads its events, keeps the gate tree), then
+        // override the transforms/axes with the saved ones (same files → same panel).
+        let active = active_shift.min(self.samples.len().saturating_sub(1));
+        self.activate_sample(active, false);
+        if session.channel_tf.len() == self.channel_tf.len() {
+            self.channel_tf = session.channel_tf;
+        }
+        let np = self.fcs.as_ref().map(|f| f.n_params()).unwrap_or(1).max(1);
+        self.x_ch = session.x_ch.min(np - 1);
+        self.y_ch = session.y_ch.min(np - 1);
+        self.hist_ch = session.hist_ch.min(np - 1);
+        self.needs_reprocess = true; self.needs_rescatter = true; self.needs_regate = true;
+        self.scatter = None; self.hist_cache = None;
+        self.status = if missing == 0 {
+            format!("Loaded session ({} samples) from {}", self.samples.len(), path.display())
+        } else {
+            format!("Loaded session — ⚠ {} file(s) missing and skipped", missing)
+        };
+    }
+
     fn panel_status(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(&self.status).small());
-                if let Some(sc) = &self.scatter {
-                    let shown: usize = sc.buckets.iter().map(|b| b.len()).sum();
-                    let total = self.fcs.as_ref().map(|f| f.n_events).unwrap_or(0);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(sc) = &self.scatter {
+                        let shown: usize = sc.buckets.iter().map(|b| b.len()).sum();
+                        let total = self.fcs.as_ref().map(|f| f.n_events).unwrap_or(0);
                         ui.label(RichText::new(format!("showing {}/{} events", shown, total))
                             .small().color(Color32::GRAY));
-                    });
-                }
+                    }
+                    if let Some(c) = &self.cursor_label {
+                        ui.separator();
+                        ui.label(RichText::new(format!("⌖ {}", c)).small().monospace()
+                            .color(Color32::from_rgb(120, 160, 210)));
+                    }
+                });
             });
         });
     }
@@ -1203,6 +1750,349 @@ impl FlowCytoApp {
         });
     }
 
+    // ── 2×2 grid of plots ─────────────────────────────────────────────
+
+    fn grid_view(&mut self, ui: &mut egui::Ui) {
+        // Clear any stuck gesture owner when not actively drawing (Esc/Cancel/tool-
+        // switch don't go through a normal drag-stop, which would otherwise leave
+        // `active_grid_cell` set and lock out new gestures in every cell).
+        if self.draw_mode == DrawMode::Navigate { self.active_grid_cell = None; }
+        ui.label(RichText::new("Each cell has its own X/Y. Pick a draw tool (left), then draw/edit gates in any cell; “gate from here” drills all cells.")
+            .small().color(Color32::GRAY));
+        let avail = ui.available_size();
+        let cw = (avail.x / 2.0 - 8.0).max(120.0);
+        // Reserve room for two header rows per cell (channels + scale pickers).
+        let ch = (avail.y / 2.0 - 60.0).max(90.0);
+        for row in 0..2 {
+            ui.horizontal(|ui| {
+                for col in 0..2 {
+                    let idx = row * 2 + col;
+                    ui.allocate_ui(egui::vec2(cw, ch + 56.0), |ui| {
+                        ui.vertical(|ui| { self.grid_cell(ui, idx, cw, ch); });
+                    });
+                }
+            });
+        }
+    }
+
+    fn grid_cell(&mut self, ui: &mut egui::Ui, idx: usize, cw: f32, ch: f32) {
+        let n_params = self.fcs.as_ref().map(|f| f.n_params()).unwrap_or(1).max(1);
+        if idx >= self.grid_channels.len() { return; }
+        let (mut xi, mut yi) = self.grid_channels[idx];
+        xi = xi.min(n_params - 1);
+        yi = yi.min(n_params - 1);
+
+        // channel names for the cell pickers
+        let names: Vec<String> = self.fcs.as_ref().map(|f|
+            (0..f.n_params()).map(|i| param_full_label(f, i)).collect()).unwrap_or_default();
+
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt(format!("gx{}", idx))
+                .selected_text(names.get(xi).cloned().unwrap_or_default()).width(cw * 0.42)
+                .show_ui(ui, |ui| { for (i, nm) in names.iter().enumerate() {
+                    ui.selectable_value(&mut xi, i, nm); } });
+            ui.label("×");
+            egui::ComboBox::from_id_salt(format!("gy{}", idx))
+                .selected_text(names.get(yi).cloned().unwrap_or_default()).width(cw * 0.42)
+                .show_ui(ui, |ui| { for (i, nm) in names.iter().enumerate() {
+                    ui.selectable_value(&mut yi, i, nm); } });
+        });
+        self.grid_channels[idx] = (xi, yi);
+        // per-axis scale pickers (Linear/Log/Asinh/Logicle) right in the cell
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("scale").small().color(Color32::GRAY));
+            self.grid_axis_scale(ui, &format!("gxt{}", idx), xi);
+            self.grid_axis_scale(ui, &format!("gyt{}", idx), yi);
+        });
+
+        // (re)build this cell's buckets if channels/transforms/data changed
+        let cur_xt = self.cur_tf(xi);
+        let cur_yt = self.cur_tf(yi);
+        let stale = self.grid_cache[idx].as_ref().map(|c| {
+            c.xi != xi || c.yi != yi || c.gen != self.data_gen || c.pop != self.active_pop
+                || c.x_label != cur_xt.short_label() || c.y_label != cur_yt.short_label()
+        }).unwrap_or(true);
+        if stale {
+            let buckets = self.compute_cell_buckets(xi, yi);
+            self.grid_cache[idx] = Some(GridCell {
+                xi, yi, x_label: cur_xt.short_label().to_string(),
+                y_label: cur_yt.short_label().to_string(),
+                pop: self.active_pop, gen: self.data_gen, buckets,
+            });
+        }
+
+        let dark = self.dark_mode;
+        let cmap = self.colormap;
+        let xt = cur_xt.compile();
+        let yt = cur_yt.compile();
+        let buckets = self.grid_cache[idx].as_ref().map(|c| c.buckets.clone()).unwrap_or_default();
+        let (x_name, y_name) = (names.get(xi).cloned().unwrap_or_default(), names.get(yi).cloned().unwrap_or_default());
+
+        // gates on this channel pair (outline + label), remapped to current transforms
+        let gate_draws: Vec<(u32, String, GateShape, CompiledTransform, CompiledTransform)> =
+            self.gates.iter().filter_map(|g| {
+                if g.x_channel.eq_ignore_ascii_case(&x_name_base(&x_name))
+                    && g.y_channel.eq_ignore_ascii_case(&x_name_base(&y_name))
+                {
+                    Some((g.id, g.name.clone(), g.shape.clone(), g.x_transform.compile(), g.y_transform.compile()))
+                } else { None }
+            }).collect();
+        let gate_clamp = {
+            let (cxr, cyr) = scatter_display_range(&buckets);
+            let mx = (cxr.1 - cxr.0).abs().max(1e-9) * 0.05;
+            let my = (cyr.1 - cyr.0).abs().max(1e-9) * 0.05;
+            (cxr.0 - mx, cxr.1 + mx, cyr.0 - my, cyr.1 + my)
+        };
+
+        let xt_fmt = xt.clone(); let yt_fmt = yt.clone();
+        let xt_grid = xt.clone(); let yt_grid = yt.clone();
+        let lin_x = matches!(cur_xt, AxisTransform::Linear);
+        let lin_y = matches!(cur_yt, AxisTransform::Linear);
+
+        // ── interaction setup (mirrors the single plot, scoped to this cell) ──
+        let drawing = self.draw_mode != DrawMode::Navigate;
+        let mode = self.draw_mode;
+        let is_active = self.active_grid_cell == Some(idx);
+        let can_start = self.active_grid_cell.is_none();
+        let edit_gate: Option<(usize, GateShape, CompiledTransform, CompiledTransform)> =
+            if mode == DrawMode::Edit {
+                self.selected_gate.and_then(|sid| self.gates.iter().position(|g| g.id == sid))
+                    .and_then(|gi| {
+                        let g = &self.gates[gi];
+                        if g.x_channel.eq_ignore_ascii_case(&x_name_base(&x_name))
+                            && g.y_channel.eq_ignore_ascii_case(&x_name_base(&y_name)) {
+                            Some((gi, g.shape.clone(), g.x_transform.compile(), g.y_transform.compile()))
+                        } else { None }
+                    })
+            } else { None };
+
+        let cur_ds = self.drag_start;
+        let cur_dc = self.drag_current;
+        let cur_poly = self.poly_vertices.clone();
+        let cur_grab = self.grab_handle;
+        let cur_move_last = self.gate_move_last;
+        let mut next_ds = cur_ds;
+        let mut next_dc = cur_dc;
+        let mut next_grab = cur_grab;
+        let mut next_move_last = cur_move_last;
+        let mut next_active = self.active_grid_cell;
+        let mut new_shape: Option<GateShape> = None;
+        let mut new_quadrant: Option<[f64; 2]> = None;
+        let mut poly_add: Option<[f64; 2]> = None;
+        let mut poly_finish = false;
+        let mut exit_draw = false;
+        let mut begin_edit = false;
+        let mut handle_update: Option<(usize, usize, f64, f64)> = None;
+        let mut gate_translate: Option<(usize, f64, f64)> = None;
+        let mut hover_disp: Option<[f64; 2]> = None;
+        let mut dbl_drill: Option<[f64; 2]> = None;
+
+        let resp = Plot::new(format!("grid_{}_{}_{}_{}_{}", idx, xi, yi, cur_xt.short_label(), cur_yt.short_label()))
+            .width(cw).height(ch).allow_scroll(false)
+            .allow_drag(!drawing).allow_zoom(!drawing)
+            .allow_double_click_reset(false) // double-click = drill into a gate
+            .x_axis_label(&x_name).y_axis_label(&y_name)
+            .x_axis_formatter(move |gm: GridMark, _r| fmt_data_tick(xt_fmt.inverse(gm.value)))
+            .y_axis_formatter(move |gm: GridMark, _r| fmt_data_tick(yt_fmt.inverse(gm.value)))
+            .x_grid_spacer(move |inp| nonlinear_grid(&xt_grid, lin_x, inp))
+            .y_grid_spacer(move |inp| nonlinear_grid(&yt_grid, lin_y, inp))
+            .show(ui, |pu| {
+                for (k, pts) in buckets.iter().enumerate() {
+                    if pts.is_empty() { continue; }
+                    pu.points(Points::new(PlotPoints::new(pts.clone()))
+                        .radius(1.2).color(density_color(k, N_BUCKETS, dark, cmap)));
+                }
+                for (gid, name, shape, gxt, gyt) in &gate_draws {
+                    let (outline, fill) = gate_color(*gid);
+                    let pts: Vec<[f64; 2]> = shape.outline().iter().map(|p| [
+                        xt.forward(gxt.inverse(p[0])).clamp(gate_clamp.0, gate_clamp.1),
+                        yt.forward(gyt.inverse(p[1])).clamp(gate_clamp.2, gate_clamp.3),
+                    ]).collect();
+                    if pts.len() >= 2 {
+                        pu.polygon(PlotPolygon::new(PlotPoints::new(pts))
+                            .stroke(Stroke::new(1.4, outline)).fill_color(fill));
+                        let a = shape.label_anchor();
+                        let ax = xt.forward(gxt.inverse(a[0])).clamp(gate_clamp.0, gate_clamp.1);
+                        let ay = yt.forward(gyt.inverse(a[1])).clamp(gate_clamp.2, gate_clamp.3);
+                        pu.text(PlotText::new(PlotPoint::new(ax, ay), RichText::new(name).color(outline).size(11.0)));
+                    }
+                }
+
+                hover_disp = pu.pointer_coordinate().map(|p| [p.x, p.y]);
+                if !drawing && pu.response().double_clicked() {
+                    dbl_drill = pu.pointer_coordinate().map(|p| [p.x, p.y]);
+                }
+                if drawing {
+                    let ptr = pu.pointer_coordinate();
+                    let bounds = pu.plot_bounds();
+                    let (r_started, r_dragged, r_stopped, r_clicked, r_dbl) = {
+                        let r = pu.response();
+                        (r.drag_started(), r.dragged(), r.drag_stopped(), r.clicked(), r.double_clicked())
+                    };
+                    match mode {
+                        DrawMode::Rect | DrawMode::Ellipse => {
+                            if is_active {
+                                if let (Some(s), Some(c)) = (cur_ds, cur_dc) {
+                                    pu.line(Line::new(PlotPoints::new(rubber_band(mode, s, c)))
+                                        .color(Color32::from_rgb(240, 190, 40)).width(1.5));
+                                }
+                            }
+                            if r_started && can_start { next_active = Some(idx); next_ds = ptr.map(|p| [p.x, p.y]); next_dc = next_ds; }
+                            if r_dragged && is_active { if let Some(p) = ptr { next_dc = Some([p.x, p.y]); } }
+                            if r_stopped && is_active {
+                                let end = ptr.map(|p| [p.x, p.y]).or(next_dc);
+                                if let (Some(s), Some(c)) = (next_ds, end) { new_shape = Some(shape_from_drag(mode, s, c)); exit_draw = true; }
+                                next_ds = None; next_dc = None; next_active = None;
+                            }
+                        }
+                        DrawMode::Polygon => {
+                            if is_active && !cur_poly.is_empty() {
+                                let mut line = cur_poly.clone();
+                                if let Some(p) = ptr { line.push([p.x, p.y]); }
+                                pu.line(Line::new(PlotPoints::new(line)).color(Color32::from_rgb(240, 190, 40)).width(1.5));
+                                pu.points(Points::new(PlotPoints::new(cur_poly.clone())).radius(3.0).color(Color32::from_rgb(240, 190, 40)));
+                            }
+                            if r_clicked && (is_active || (can_start && cur_poly.is_empty())) {
+                                if let Some(p) = ptr {
+                                    let w = bounds.width().max(1e-9); let h = bounds.height().max(1e-9);
+                                    let close = cur_poly.first().map(|f| ((p.x - f[0]) / w).powi(2) + ((p.y - f[1]) / h).powi(2) < 0.0004).unwrap_or(false);
+                                    if close && cur_poly.len() >= 3 { poly_finish = true; }
+                                    else { if cur_poly.is_empty() { next_active = Some(idx); } poly_add = Some([p.x, p.y]); }
+                                }
+                            }
+                            if r_dbl && is_active && cur_poly.len() >= 3 { poly_finish = true; }
+                        }
+                        DrawMode::Quadrant => {
+                            if let Some(p) = ptr {
+                                let (x0, x1, y0, y1) = (bounds.min()[0], bounds.max()[0], bounds.min()[1], bounds.max()[1]);
+                                pu.line(Line::new(PlotPoints::new(vec![[p.x, y0], [p.x, y1]])).color(Color32::from_rgb(240, 190, 40)).width(1.2));
+                                pu.line(Line::new(PlotPoints::new(vec![[x0, p.y], [x1, p.y]])).color(Color32::from_rgb(240, 190, 40)).width(1.2));
+                            }
+                            if r_clicked { if let Some(p) = ptr { new_quadrant = Some([p.x, p.y]); } }
+                        }
+                        DrawMode::Edit => {
+                            if let Some((gi, shape, gxt, gyt)) = &edit_gate {
+                                let handles: Vec<[f64; 2]> = gate_handles(shape).iter()
+                                    .map(|p| [xt.forward(gxt.inverse(p[0])).clamp(gate_clamp.0, gate_clamp.1),
+                                              yt.forward(gyt.inverse(p[1])).clamp(gate_clamp.2, gate_clamp.3)]).collect();
+                                pu.points(Points::new(PlotPoints::new(handles.clone())).radius(5.0).color(Color32::from_rgb(240, 190, 40)));
+                                let w = bounds.width().max(1e-9); let h = bounds.height().max(1e-9);
+                                let to_gate = |p: PlotPoint| [gxt.forward(xt.inverse(p.x)), gyt.forward(yt.inverse(p.y))];
+                                if r_started && can_start {
+                                    if let Some(p) = ptr {
+                                        let mut best: Option<(usize, f64)> = None;
+                                        for (i, hp) in handles.iter().enumerate() {
+                                            let d = ((p.x - hp[0]) / w).powi(2) + ((p.y - hp[1]) / h).powi(2);
+                                            if d < 0.0025 && best.map(|(_, bd)| d < bd).unwrap_or(true) { best = Some((i, d)); }
+                                        }
+                                        next_grab = best.map(|(i, _)| i);
+                                        if next_grab.is_none() {
+                                            let g = to_gate(p);
+                                            next_move_last = if shape.contains(g[0], g[1]) { Some(g) } else { None };
+                                        } else { next_move_last = None; }
+                                        if next_grab.is_some() || next_move_last.is_some() { begin_edit = true; next_active = Some(idx); }
+                                    }
+                                }
+                                if r_dragged && is_active {
+                                    if let (Some(p), Some(hg)) = (ptr, next_grab) {
+                                        let g = to_gate(p); handle_update = Some((*gi, hg, g[0], g[1]));
+                                    } else if let (Some(p), Some(last)) = (ptr, next_move_last) {
+                                        let g = to_gate(p); gate_translate = Some((*gi, g[0] - last[0], g[1] - last[1])); next_move_last = Some(g);
+                                    }
+                                }
+                                if r_stopped && is_active { next_grab = None; next_move_last = None; next_active = None; }
+                            }
+                        }
+                        DrawMode::Navigate => {}
+                    }
+                }
+            });
+
+        // ── apply interaction (only the active cell yields commits) ──
+        self.drag_start = next_ds;
+        self.drag_current = next_dc;
+        self.active_grid_cell = next_active;
+        if begin_edit { self.push_undo(); }
+        self.grab_handle = next_grab;
+        self.gate_move_last = next_move_last;
+        if let Some(v) = poly_add { self.poly_vertices.push(v); }
+        if poly_finish { self.finish_polygon(); }
+        if let Some(shape) = new_shape { self.commit_gate_on(xi, yi, shape); self.draw_mode = DrawMode::Navigate; }
+        if let Some(c) = new_quadrant { self.commit_quadrant_on(xi, yi, c[0], c[1]); self.draw_mode = DrawMode::Navigate; }
+        if exit_draw { self.draw_mode = DrawMode::Navigate; }
+        if let Some((gi, hh, gx, gy)) = handle_update {
+            if gi < self.gates.len() { apply_gate_handle(&mut self.gates[gi].shape, hh, gx, gy); self.needs_regate = true; }
+        }
+        if let Some((gi, dx, dy)) = gate_translate {
+            if gi < self.gates.len() { translate_shape(&mut self.gates[gi].shape, dx, dy); self.needs_regate = true; }
+        }
+        if let Some(p) = dbl_drill { self.drill_at(&x_name, &y_name, &xt, &yt, p); }
+        if resp.response.hovered() {
+            if let Some(d) = hover_disp {
+                self.cursor_label = Some(format!("{} {} · {} {}",
+                    short_chan(&x_name_base(&x_name)), fmt_data_tick(xt.inverse(d[0])),
+                    short_chan(&x_name_base(&y_name)), fmt_data_tick(yt.inverse(d[1]))));
+            }
+        }
+    }
+
+    /// Inline spillover adjuster for the current X↔Y pair, with live plot update.
+    /// Targets the classic "this channel under-corrects into that one" problem
+    /// (e.g. MHCII → CD11b) without leaving the Plot tab.
+    fn ui_comp_preview(&mut self, ui: &mut egui::Ui, x_name: &str, y_name: &str) {
+        let xb = x_name_base(x_name);
+        let yb = x_name_base(y_name);
+        egui::CollapsingHeader::new("⚖ Compensation (current X↔Y)").id_salt("comp_preview").show(ui, |ui| {
+            let mat = self.active_matrix();
+            let channels = match &mat { Some((c, _)) => c.clone(), None => {
+                ui.label(RichText::new("No spillover matrix for this file — create one on the Spillover tab.")
+                    .small().color(Color32::GRAY));
+                return;
+            }};
+            if !self.do_compensate {
+                ui.label(RichText::new("Tip: turn on “Compensate” in the toolbar to see the effect live.")
+                    .small().color(Color32::from_rgb(220, 170, 60)));
+            }
+            let xi = channels.iter().position(|c| c.eq_ignore_ascii_case(&xb));
+            let yi = channels.iter().position(|c| c.eq_ignore_ascii_case(&yb));
+            let (xi, yi) = match (xi, yi) {
+                (Some(a), Some(b)) if a != b => (a, b),
+                _ => {
+                    ui.label(RichText::new("Put two different fluorescence channels on X and Y to adjust their spillover.")
+                        .small().color(Color32::GRAY));
+                    return;
+                }
+            };
+            let rows = mat.as_ref().map(|(_, r)| r.clone()).unwrap_or_default();
+            let (mut sxy, mut syx) = (rows[xi][yi], rows[yi][xi]);
+            let mut changed = false;
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("{} → {}", short_chan(&xb), short_chan(&yb))).small());
+                if ui.add(egui::DragValue::new(&mut sxy).speed(0.001).fixed_decimals(4).range(-2.0..=2.0)).changed() { changed = true; }
+                ui.label(RichText::new(format!("   {} → {}", short_chan(&yb), short_chan(&xb))).small());
+                if ui.add(egui::DragValue::new(&mut syx).speed(0.001).fixed_decimals(4).range(-2.0..=2.0)).changed() { changed = true; }
+            });
+            if changed {
+                if self.spill_override.is_none() { self.start_override(); }
+                if let Some(ov) = &mut self.spill_override {
+                    let a = ov.channels.iter().position(|c| c.eq_ignore_ascii_case(&xb));
+                    let b = ov.channels.iter().position(|c| c.eq_ignore_ascii_case(&yb));
+                    if let (Some(a), Some(b)) = (a, b) { ov.rows[a][b] = sxy; ov.rows[b][a] = syx; }
+                }
+                if !self.do_compensate { self.do_compensate = true; }
+                self.needs_reprocess = true;
+            }
+            if self.spill_override.is_some() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("● override active").small().color(Color32::from_rgb(230, 140, 40)));
+                    if ui.small_button("↺ reset to embedded").clicked() {
+                        self.spill_override = None; self.needs_reprocess = true;
+                    }
+                });
+            }
+        });
+    }
+
     // ── Scatter plot ──────────────────────────────────────────────────
 
     fn scatter_plot(&mut self, ui: &mut egui::Ui) {
@@ -1215,9 +2105,28 @@ impl FlowCytoApp {
 
         // plot controls
         ui.horizontal(|ui| {
-            if ui.checkbox(&mut self.show_contours, "Contours").changed() { self.scatter = None; }
-            ui.label(RichText::new("iso-density lines").small().color(Color32::GRAY));
+            ui.label("Layout:");
+            ui.selectable_value(&mut self.grid_mode, false, "Single");
+            ui.selectable_value(&mut self.grid_mode, true, "2×2 grid");
+            ui.separator();
+            if !self.grid_mode {
+                if ui.checkbox(&mut self.show_contours, "Contours").changed() { self.scatter = None; }
+                ui.label(RichText::new("iso-density lines").small().color(Color32::GRAY));
+                ui.separator();
+            }
+            ui.label("Colormap:");
+            egui::ComboBox::from_id_salt("cmap").selected_text(self.colormap.label()).show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.colormap, ColorMap::Viridis, "Viridis");
+                ui.selectable_value(&mut self.colormap, ColorMap::Jet, "Jet");
+            });
+            // PNG export captures one plot; not meaningful for the grid overview.
+            if !self.grid_mode {
+                ui.separator();
+                if ui.button("📷 Save plot…").clicked() { self.request_plot_png(); }
+            }
         });
+
+        if self.grid_mode { self.grid_view(ui); return; }
 
         let n_params = self.fcs.as_ref().map(|f| f.n_params()).unwrap_or(1).max(1);
         let xi = self.x_ch.min(n_params - 1);
@@ -1227,11 +2136,14 @@ impl FlowCytoApp {
         let xt = cur_xt.compile();
         let yt = cur_yt.compile();
         let dark = self.dark_mode;
+        let cmap = self.colormap;
 
         let (x_name, y_name) = {
             let f = self.fcs.as_ref().unwrap();
             (param_full_label(f, xi), param_full_label(f, yi))
         };
+
+        self.ui_comp_preview(ui, &x_name, &y_name);
 
         // Stale-scatter guard: rebuild if channel/transform changed without a flag.
         let stale = self.scatter.as_ref().map(|s| {
@@ -1260,8 +2172,8 @@ impl FlowCytoApp {
         let contours: Vec<[[f64; 2]; 2]> = self.scatter.as_ref().map(|s| s.contours.clone()).unwrap_or_default();
 
         // Gate render data for the CURRENT channel pair (any transform — remap below).
-        let gate_draws: Vec<(usize, String, GateShape, CompiledTransform, CompiledTransform)> =
-            self.gates.iter().enumerate().filter_map(|(i, g)| {
+        let gate_draws: Vec<(u32, String, GateShape, CompiledTransform, CompiledTransform)> =
+            self.gates.iter().filter_map(|g| {
                 if g.x_channel.eq_ignore_ascii_case(&x_name_base(&x_name))
                     && g.y_channel.eq_ignore_ascii_case(&x_name_base(&y_name))
                 {
@@ -1273,7 +2185,7 @@ impl FlowCytoApp {
                         }
                         None => g.name.clone(),
                     };
-                    Some((i, label, g.shape.clone(),
+                    Some((g.id, label, g.shape.clone(),
                           g.x_transform.compile(), g.y_transform.compile()))
                 } else { None }
             }).collect();
@@ -1330,6 +2242,11 @@ impl FlowCytoApp {
         let cur_grab = self.grab_handle;
         let mut next_grab = cur_grab;
         let mut handle_update: Option<(usize, usize, f64, f64)> = None; // (gate_idx, handle, gx, gy)
+        let mut hover_disp: Option<[f64; 2]> = None; // cursor position in display coords
+        let cur_move_last = self.gate_move_last;
+        let mut next_move_last = cur_move_last;
+        let mut gate_translate: Option<(usize, f64, f64)> = None; // (gate_idx, dx, dy) in gate-display coords
+        let mut begin_edit = false; // an Edit gesture (resize/move/rotate) started this frame → snapshot undo
 
         // Axis formatters (data units) — clone compiled transforms into closures.
         let xt_fmt = xt.clone();
@@ -1352,15 +2269,21 @@ impl FlowCytoApp {
             .allow_drag(!drawing)
             .allow_zoom(!drawing)
             .allow_scroll(false)
+            .allow_double_click_reset(false) // double-click = drill into a gate
             .x_axis_formatter(move |gm: GridMark, _r| fmt_data_tick(xt_fmt.inverse(gm.value)))
             .y_axis_formatter(move |gm: GridMark, _r| fmt_data_tick(yt_fmt.inverse(gm.value)))
             .x_grid_spacer(move |inp| nonlinear_grid(&xt_grid, lin_x, inp))
             .y_grid_spacer(move |inp| nonlinear_grid(&yt_grid, lin_y, inp));
 
-        plot.show(ui, |pu| {
+        let mut dbl_drill: Option<[f64; 2]> = None;
+        let plot_response = plot.show(ui, |pu| {
             if let Some(b) = manual_bounds {
                 pu.set_plot_bounds(b);
                 pu.set_auto_bounds(egui::Vec2b::new(false, false));
+            }
+            hover_disp = pu.pointer_coordinate().map(|p| [p.x, p.y]);
+            if !drawing && pu.response().double_clicked() {
+                dbl_drill = pu.pointer_coordinate().map(|p| [p.x, p.y]);
             }
 
             // backgate: parent population events (faint blue-grey, for context)
@@ -1383,7 +2306,7 @@ impl FlowCytoApp {
             for (k, pts) in buckets.iter().enumerate() {
                 if pts.is_empty() { continue; }
                 pu.points(Points::new(PlotPoints::new(pts.clone()))
-                    .radius(1.4).color(density_color(k, N_BUCKETS, dark)));
+                    .radius(1.4).color(density_color(k, N_BUCKETS, dark, cmap)));
             }
 
             // iso-density contour lines (on top of the dots)
@@ -1396,8 +2319,8 @@ impl FlowCytoApp {
             }
 
             // gate overlays (remap stored→data→current display)
-            for (idx, name, shape, gxt, gyt) in &gate_draws {
-                let (outline, fill) = gate_color(*idx);
+            for (gid, name, shape, gxt, gyt) in &gate_draws {
+                let (outline, fill) = gate_color(*gid);
                 let pts: Vec<[f64; 2]> = shape.outline().iter()
                     .map(|p| [
                         xt.forward(gxt.inverse(p[0])).clamp(gate_clamp.0, gate_clamp.1),
@@ -1475,6 +2398,8 @@ impl FlowCytoApp {
                                 .radius(5.0).color(Color32::from_rgb(240, 190, 40)));
                             let w = bounds.width().max(1e-9);
                             let h = bounds.height().max(1e-9);
+                            // gate-display coords of the cursor (this gate's own transforms)
+                            let to_gate = |p: PlotPoint| [gxt.forward(xt.inverse(p.x)), gyt.forward(yt.inverse(p.y))];
                             if r_started {
                                 if let Some(p) = ptr {
                                     let mut best: Option<(usize, f64)> = None;
@@ -1483,15 +2408,27 @@ impl FlowCytoApp {
                                         if d < 0.0025 && best.map(|(_, bd)| d < bd).unwrap_or(true) { best = Some((i, d)); }
                                     }
                                     next_grab = best.map(|(i, _)| i);
+                                    // No handle grabbed but cursor is inside the gate → drag the whole body.
+                                    if next_grab.is_none() {
+                                        let g = to_gate(p);
+                                        next_move_last = if shape.contains(g[0], g[1]) { Some(g) } else { None };
+                                    } else {
+                                        next_move_last = None;
+                                    }
+                                    if next_grab.is_some() || next_move_last.is_some() { begin_edit = true; }
                                 }
                             }
                             if r_dragged {
                                 if let (Some(p), Some(hg)) = (ptr, next_grab) {
-                                    handle_update = Some((*gidx, hg,
-                                        gxt.forward(xt.inverse(p.x)), gyt.forward(yt.inverse(p.y))));
+                                    let g = to_gate(p);
+                                    handle_update = Some((*gidx, hg, g[0], g[1]));
+                                } else if let (Some(p), Some(last)) = (ptr, next_move_last) {
+                                    let g = to_gate(p);
+                                    gate_translate = Some((*gidx, g[0] - last[0], g[1] - last[1]));
+                                    next_move_last = Some(g);
                                 }
                             }
-                            if r_stopped { next_grab = None; }
+                            if r_stopped { next_grab = None; next_move_last = None; }
                         }
                     }
                     DrawMode::Quadrant => {
@@ -1516,15 +2453,13 @@ impl FlowCytoApp {
         self.drag_start = next_ds;
         self.drag_current = next_dc;
         if let Some(v) = poly_add { self.poly_vertices.push(v); }
-        if poly_finish {
-            let verts = std::mem::take(&mut self.poly_vertices);
-            if verts.len() >= 3 { self.commit_gate(GateShape::Polygon { vertices: verts }); }
-            self.draw_mode = DrawMode::Navigate;
-        }
+        if poly_finish { self.finish_polygon(); }
         if let Some(shape) = new_shape { self.commit_gate(shape); }
         if let Some(c) = new_quadrant { self.commit_quadrant(c[0], c[1]); self.draw_mode = DrawMode::Navigate; }
         if exit_draw { self.draw_mode = DrawMode::Navigate; }
+        if begin_edit { self.push_undo(); }
         self.grab_handle = next_grab;
+        self.gate_move_last = next_move_last;
         if let Some((gidx, h, gx, gy)) = handle_update {
             if gidx < self.gates.len() {
                 apply_gate_handle(&mut self.gates[gidx].shape, h, gx, gy);
@@ -1532,6 +2467,25 @@ impl FlowCytoApp {
                 if self.active_pop.is_some() { self.scatter = None; }
             }
         }
+        if let Some((gidx, dx, dy)) = gate_translate {
+            if gidx < self.gates.len() {
+                translate_shape(&mut self.gates[gidx].shape, dx, dy);
+                self.needs_regate = true;
+                if self.active_pop.is_some() { self.scatter = None; }
+            }
+        }
+        if let Some(p) = dbl_drill { self.drill_at(&x_name, &y_name, &xt, &yt, p); }
+
+        // Live cursor readout (display → data units), shown in the status bar.
+        self.cursor_label = hover_disp.map(|d| {
+            let (xb, yb) = (x_name_base(&x_name), x_name_base(&y_name));
+            format!("{} {} · {} {}",
+                short_chan(&xb), fmt_data_tick(xt.inverse(d[0])),
+                short_chan(&yb), fmt_data_tick(yt.inverse(d[1])))
+        });
+
+        // Remember the plot's screen rect so a screenshot can be cropped to it.
+        self.last_plot_rect = Some(plot_response.response.rect);
     }
 
     // ── Histogram ─────────────────────────────────────────────────────
@@ -1544,7 +2498,8 @@ impl FlowCytoApp {
             return;
         }
         let n_params = self.fcs.as_ref().map(|f| f.n_params()).unwrap_or(1).max(1);
-        let xi = self.x_ch.min(n_params - 1);
+        if self.hist_ch >= n_params { self.hist_ch = self.x_ch.min(n_params - 1); }
+        let xi = self.hist_ch.min(n_params - 1);
         let cur_xt = self.cur_tf(xi);
         let x_name = self.fcs.as_ref().map(|f| param_full_label(f, xi)).unwrap_or_default();
 
@@ -1554,10 +2509,20 @@ impl FlowCytoApp {
         }).unwrap_or(true);
         if stale { self.rebuild_histogram(); }
 
+        // channel names for the picker
+        let ch_names: Vec<String> = self.fcs.as_ref().map(|f|
+            (0..f.n_params()).map(|i| param_full_label(f, i)).collect()).unwrap_or_default();
+
         // controls
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("Channel: {}", x_name)).strong());
-            ui.label(RichText::new("(set by X on the left panel)").small().color(Color32::GRAY));
+            ui.label("Channel:");
+            egui::ComboBox::from_id_salt("histch").selected_text(&x_name).width(180.0).show_ui(ui, |ui| {
+                for (i, nm) in ch_names.iter().enumerate() {
+                    if ui.selectable_label(self.hist_ch == i, nm).clicked() {
+                        self.hist_ch = i; self.hist_cache = None;
+                    }
+                }
+            });
             ui.separator();
             ui.label("Y:");
             if ui.selectable_value(&mut self.hist_norm, HistNorm::Modal, "Modal %").clicked() { self.hist_cache = None; }
@@ -1573,6 +2538,8 @@ impl FlowCytoApp {
                 self.hist_draw_interval = !drawing;
                 self.drag_start = None; self.drag_current = None;
             }
+            ui.separator();
+            if ui.button("📷 Save plot…").clicked() { self.request_plot_png(); }
         });
 
         // overlay mode: populations (1 sample) vs samples (workspace)
@@ -1612,8 +2579,8 @@ impl FlowCytoApp {
             });
         } else {
             // population visibility toggles (populations mode)
-            let gate_list: Vec<(u32, String, Color32)> = self.gates.iter().enumerate()
-                .map(|(i, g)| (g.id, g.name.clone(), gate_color(i).0)).collect();
+            let gate_list: Vec<(u32, String, Color32)> = self.gates.iter()
+                .map(|g| (g.id, g.name.clone(), gate_color(g.id).0)).collect();
             ui.horizontal_wrapped(|ui| {
                 ui.label("Show:");
                 let mut all_vis = !self.hist_all_hidden;
@@ -1643,12 +2610,12 @@ impl FlowCytoApp {
 
         let xt = cur_xt.compile();
         let x_base = x_name_base(&x_name);
-        let range_gates: Vec<(String, Color32, f64, f64)> = self.gates.iter().enumerate()
-            .filter_map(|(i, g)| {
+        let range_gates: Vec<(String, Color32, f64, f64)> = self.gates.iter()
+            .filter_map(|g| {
                 if let GateShape::Range { x_min, x_max } = &g.shape {
                     if g.x_channel.eq_ignore_ascii_case(&x_base) {
                         let gxt = g.x_transform.compile();
-                        return Some((g.name.clone(), gate_color(i).0,
+                        return Some((g.name.clone(), gate_color(g.id).0,
                                      xt.forward(gxt.inverse(*x_min)), xt.forward(gxt.inverse(*x_max))));
                     }
                 }
@@ -1676,7 +2643,7 @@ impl FlowCytoApp {
             .x_axis_formatter(move |gm: GridMark, _r| fmt_data_tick(xt_fmt.inverse(gm.value)))
             .x_grid_spacer(move |inp| nonlinear_grid(&xt_grid, lin_x, inp));
 
-        plot.show(ui, |pu| {
+        let hist_response = plot.show(ui, |pu| {
             let bounds = pu.plot_bounds();
             let (ymin, ymax) = (bounds.min()[1], bounds.max()[1]);
 
@@ -1715,6 +2682,7 @@ impl FlowCytoApp {
 
         self.drag_start = next_ds;
         self.drag_current = next_dc;
+        self.last_plot_rect = Some(hist_response.response.rect);
         if let Some((a, b)) = new_interval {
             self.commit_range_gate(a, b);
             self.hist_draw_interval = false;
@@ -1814,46 +2782,173 @@ impl FlowCytoApp {
         }
     }
 
+    // ── Plot PNG export ───────────────────────────────────────────────
+
+    /// Request a full-viewport screenshot; the captured frame is cropped to the
+    /// last plot's rect and saved as PNG once it arrives (see `poll_screenshot`).
+    fn request_plot_png(&mut self) {
+        if self.last_plot_rect.is_none() {
+            self.status = "Open the Plot or Histogram tab first.".into();
+            return;
+        }
+        self.screenshot_pending = true;
+        self.screenshot_sent = false;
+    }
+
+    /// Drive the async screenshot: dispatch the command once, then catch the
+    /// delivered image on a later frame and save it.
+    fn poll_screenshot(&mut self, ctx: &egui::Context) {
+        if !self.screenshot_pending { return; }
+        let shot = ctx.input(|i| i.events.iter().find_map(|e| {
+            if let egui::Event::Screenshot { image, .. } = e { Some(image.clone()) } else { None }
+        }));
+        if let Some(img) = shot {
+            let ppp = ctx.pixels_per_point();
+            self.screenshot_pending = false;
+            self.screenshot_sent = false;
+            self.save_screenshot_png(&img, ppp);
+        } else if !self.screenshot_sent {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
+            self.screenshot_sent = true;
+            ctx.request_repaint();
+        }
+    }
+
+    /// Crop a captured viewport image to the plot rect and write it as a PNG.
+    fn save_screenshot_png(&mut self, image: &egui::ColorImage, ppp: f32) {
+        let rect = match self.last_plot_rect { Some(r) => r, None => return };
+        let [iw, ih] = image.size;
+        // Plot rect is in points; the captured image is in physical pixels.
+        let x0 = ((rect.min.x * ppp).floor() as usize).min(iw);
+        let y0 = ((rect.min.y * ppp).floor() as usize).min(ih);
+        let x1 = ((rect.max.x * ppp).ceil() as usize).min(iw);
+        let y1 = ((rect.max.y * ppp).ceil() as usize).min(ih);
+        let (cw, ch) = (x1.saturating_sub(x0), y1.saturating_sub(y0));
+        if cw == 0 || ch == 0 { self.status = "Plot rect empty — nothing to save.".into(); return; }
+
+        let mut buf: Vec<u8> = Vec::with_capacity(cw * ch * 4);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let p = image.pixels[y * iw + x];
+                buf.extend_from_slice(&[p.r(), p.g(), p.b(), p.a()]);
+            }
+        }
+        let default = self.file_path.as_ref().and_then(|p| p.file_stem())
+            .map(|s| format!("{}_plot.png", s.to_string_lossy()))
+            .unwrap_or_else(|| "plot.png".into());
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("PNG", &["png"]).set_file_name(default).save_file()
+        {
+            let res = image::RgbaImage::from_raw(cw as u32, ch as u32, buf)
+                .ok_or_else(|| "buffer size mismatch".to_string())
+                .and_then(|img| img.save(&path).map_err(|e| e.to_string()));
+            self.status = match res {
+                Ok(_) => format!("Saved plot → {}", path.display()),
+                Err(e) => format!("PNG save error: {}", e),
+            };
+        }
+    }
+
     // ── Batch ─────────────────────────────────────────────────────────
 
-    /// Run the current gate tree + compensation over every workspace sample,
-    /// STREAMING: each file's events are loaded, summarized, then dropped — only
-    /// the (small) stat tables are kept, so memory stays flat across many files.
+    /// Start a background batch over every workspace sample. Each file is loaded,
+    /// summarized, and dropped on a worker thread (memory stays flat), with results
+    /// streamed back so the UI never freezes. Re-runs cancel any in-flight batch.
     fn run_batch(&mut self) {
         if self.samples.is_empty() {
             self.status = "No samples in the workspace.".into();
             return;
         }
+        self.cancel_batch();
+
+        let samples: Vec<(PathBuf, String, String)> = self.samples.iter()
+            .map(|s| (s.path.clone(), s.name.clone(), s.group.clone())).collect();
+        let total = samples.len();
         let gates = self.gates.clone();
-        let mut tables: Vec<(String, PopulationStatsTable)> = Vec::new();
-        let mut skipped: Vec<(String, String)> = Vec::new();
+        let do_comp = self.do_compensate;
+        let ov = self.spill_override.clone();
 
-        for s in &self.samples {
-            let fcs = match FcsFile::open(&s.path) {
-                Ok(f) => f,
-                Err(e) => { skipped.push((s.name.clone(), e.to_string())); continue; }
-            };
-            let missing = missing_gate_channels(&gates, &fcs);
-            if !missing.is_empty() {
-                skipped.push((s.name.clone(), format!("missing channels: {}", missing.join(", "))));
-                continue;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_worker = cancel.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<BatchMsg>();
+
+        std::thread::spawn(move || {
+            for (i, (path, name, group)) in samples.into_iter().enumerate() {
+                if cancel_worker.load(Ordering::Relaxed) { break; }
+                let _ = tx.send(BatchMsg::Progress { done: i, total, name: name.clone() });
+                let fcs = match FcsFile::open(&path) {
+                    Ok(f) => f,
+                    Err(e) => { let _ = tx.send(BatchMsg::Skip(name, e.to_string())); continue; }
+                };
+                let missing = missing_gate_channels(&gates, &fcs);
+                if !missing.is_empty() {
+                    let _ = tx.send(BatchMsg::Skip(name, format!("missing channels: {}", missing.join(", "))));
+                    continue;
+                }
+                let events = match compensate_for(&fcs, do_comp, ov.as_ref()) {
+                    Ok(e) => e,
+                    Err(e) => { let _ = tx.send(BatchMsg::Skip(name, format!("compensation failed: {}", e))); continue; }
+                };
+                let stat_channels: Vec<usize> = fcs.parameters.iter().enumerate()
+                    .filter(|(_, p)| !p.name.eq_ignore_ascii_case("Time"))
+                    .map(|(i, _)| i).collect();
+                let table = population_stats(&events, &fcs.parameters, fcs.n_events, &gates, &stat_channels);
+                let _ = tx.send(BatchMsg::Table(group, name, table));
+                // `fcs` and `events` drop here → flat memory
             }
-            let events = match self.compensate_events(&fcs) {
-                Ok(e) => e,
-                Err(e) => { skipped.push((s.name.clone(), format!("compensation failed: {}", e))); continue; }
-            };
-            let stat_channels: Vec<usize> = fcs.parameters.iter().enumerate()
-                .filter(|(_, p)| !p.name.eq_ignore_ascii_case("Time"))
-                .map(|(i, _)| i).collect();
-            let table = population_stats(&events, &fcs.parameters, fcs.n_events, &gates, &stat_channels);
-            tables.push((s.name.clone(), table));
-            // `fcs` and `events` drop here → flat memory
-        }
+            let _ = tx.send(BatchMsg::Done);
+        });
 
-        let n = tables.len();
-        let n_skip = skipped.len();
-        self.batch = Some(BatchResult { tables, skipped });
-        self.status = format!("Batch: {} processed, {} skipped", n, n_skip);
+        self.batch = Some(BatchResult { tables: Vec::new(), skipped: Vec::new() });
+        self.batch_rx = Some(rx);
+        self.batch_cancel = Some(cancel);
+        self.batch_progress = Some((0, total));
+        self.status = format!("Batch started: 0/{}", total);
+    }
+
+    /// Signal the worker to stop and detach from it.
+    fn cancel_batch(&mut self) {
+        if let Some(c) = &self.batch_cancel { c.store(true, Ordering::Relaxed); }
+        self.batch_rx = None;
+        self.batch_cancel = None;
+        self.batch_progress = None;
+    }
+
+    /// Drain streamed batch results into `self.batch`; called every frame while running.
+    fn poll_batch(&mut self, ctx: &egui::Context) {
+        if self.batch_rx.is_none() { return; }
+        let mut msgs: Vec<BatchMsg> = Vec::new();
+        let mut finished = false;
+        if let Some(rx) = &self.batch_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(m) => msgs.push(m),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => { finished = true; break; }
+                }
+            }
+        }
+        for m in msgs {
+            match m {
+                BatchMsg::Progress { done, total, name } => {
+                    self.batch_progress = Some((done, total));
+                    self.status = format!("Batch {}/{}: {}", done, total, name);
+                }
+                BatchMsg::Table(g, s, t) => { if let Some(b) = &mut self.batch { b.tables.push((g, s, t)); } }
+                BatchMsg::Skip(s, r) => { if let Some(b) = &mut self.batch { b.skipped.push((s, r)); } }
+                BatchMsg::Done => { finished = true; }
+            }
+        }
+        if finished {
+            let n = self.batch.as_ref().map(|b| b.tables.len()).unwrap_or(0);
+            let ns = self.batch.as_ref().map(|b| b.skipped.len()).unwrap_or(0);
+            self.batch_rx = None;
+            self.batch_cancel = None;
+            self.batch_progress = None;
+            self.status = format!("Batch done: {} processed, {} skipped", n, ns);
+        } else {
+            ctx.request_repaint(); // keep ticking while the worker runs
+        }
     }
 
     fn export_batch_csv(&mut self) {
@@ -1862,10 +2957,10 @@ impl FlowCytoApp {
             .add_filter("CSV", &["csv"]).set_file_name("batch_popstats.csv").save_file()
         {
             let mut s = String::new();
-            s.push_str(LONG_CSV_HEADER);
+            s.push_str(LONG_CSV_HEADER_GROUPED);
             s.push('\n');
-            for (sample, table) in &batch.tables {
-                append_long_csv(&mut s, sample, table);
+            for (group, sample, table) in &batch.tables {
+                append_long_csv_grouped(&mut s, group, sample, table);
             }
             self.status = match std::fs::write(&path, s) {
                 Ok(_) => format!("Exported batch ({} samples) → {}", batch.tables.len(), path.display()),
@@ -1877,21 +2972,33 @@ impl FlowCytoApp {
     fn batch_view(&mut self, ui: &mut egui::Ui) {
         let mut do_run = false;
         let mut do_export = false;
+        let mut do_cancel = false;
+        let running = self.batch_rx.is_some();
         ui.horizontal(|ui| {
             ui.heading("Batch");
-            if ui.button("▶ Run over all samples").clicked() { do_run = true; }
-            if self.batch.is_some() && ui.button("💾 Export combined CSV").clicked() { do_export = true; }
+            if ui.add_enabled(!running, egui::Button::new("▶ Run over all samples")).clicked() { do_run = true; }
+            if running && ui.button("✖ Cancel").clicked() { do_cancel = true; }
+            if self.batch.is_some() && !running && ui.button("💾 Export combined CSV").clicked() { do_export = true; }
         });
         ui.label(RichText::new(format!(
-            "{} samples · {} gates · streamed (memory stays flat)", self.samples.len(), self.gates.len()
+            "{} samples · {} gates · streamed on a worker thread (UI stays responsive)", self.samples.len(), self.gates.len()
         )).small().color(Color32::GRAY));
+        if let Some((done, total)) = self.batch_progress {
+            let frac = if total > 0 { done as f32 / total as f32 } else { 0.0 };
+            ui.add(egui::ProgressBar::new(frac).show_percentage()
+                .text(format!("{}/{}", done, total)));
+        }
         ui.separator();
 
         if do_run { self.run_batch(); }
+        if do_cancel { self.cancel_batch(); self.status = "Batch cancelled.".into(); }
         if do_export { self.export_batch_csv(); }
 
-        // Clone display data out of the batch borrow.
-        let (channels, rows, skipped): (Vec<String>, Vec<(String, String, usize, usize, f64, f64, Vec<f64>)>, Vec<(String, String)>) =
+        // Clone display data out of the batch borrow. Each row carries its OWN
+        // table's channel list so the MFI is looked up by NAME (panels may differ
+        // in channel order across tubes), not by a shared positional index.
+        #[allow(clippy::type_complexity)]
+        let (channels, rows, skipped): (Vec<String>, Vec<(String, String, String, usize, usize, f64, f64, Vec<f64>, Vec<String>)>, Vec<(String, String)>) =
             match &self.batch {
                 None => {
                     ui.label(RichText::new("Click “Run over all samples” to compute population stats across the workspace.")
@@ -1899,11 +3006,17 @@ impl FlowCytoApp {
                     return;
                 }
                 Some(b) => {
-                    let channels = b.tables.first().map(|(_, t)| t.channels.clone()).unwrap_or_default();
+                    // Union of channel names across all tables (first table's order, then extras).
+                    let mut channels: Vec<String> = Vec::new();
+                    for (_, _, t) in &b.tables {
+                        for c in &t.channels {
+                            if !channels.iter().any(|x| x.eq_ignore_ascii_case(c)) { channels.push(c.clone()); }
+                        }
+                    }
                     let mut rows = Vec::new();
-                    for (sample, table) in &b.tables {
+                    for (group, sample, table) in &b.tables {
                         for r in &table.rows {
-                            rows.push((sample.clone(), r.name.clone(), r.depth, r.count, r.pct_parent, r.pct_total, r.medians.clone()));
+                            rows.push((group.clone(), sample.clone(), r.name.clone(), r.depth, r.count, r.pct_parent, r.pct_total, r.medians.clone(), table.channels.clone()));
                         }
                     }
                     (channels, rows, b.skipped.clone())
@@ -1914,6 +3027,7 @@ impl FlowCytoApp {
             ui.label(RichText::new("No samples produced stats (all skipped?).").color(Color32::from_rgb(220, 150, 50)));
         } else {
             let ci = self.batch_channel.min(channels.len() - 1);
+            let sel_name = channels[ci].clone();
             ui.horizontal(|ui| {
                 ui.label("MFI channel:");
                 egui::ComboBox::from_id_salt("batchch").selected_text(&channels[ci]).show_ui(ui, |ui| {
@@ -1922,21 +3036,23 @@ impl FlowCytoApp {
                     }
                 });
             });
-            let ci = self.batch_channel.min(channels.len() - 1);
             egui::ScrollArea::both().show(ui, |ui| {
                 egui::Grid::new("batch_grid").striped(true).spacing([14.0, 4.0]).show(ui, |ui| {
-                    for h in &["Sample", "Population", "Count", "%Parent", "%Total"] {
+                    for h in &["Group", "Sample", "Population", "Count", "%Parent", "%Total"] {
                         ui.label(RichText::new(*h).strong());
                     }
-                    ui.label(RichText::new(format!("MFI {}", channels[ci])).strong());
+                    ui.label(RichText::new(format!("MFI {}", sel_name)).strong());
                     ui.end_row();
-                    for (sample, name, depth, count, pp, pt, medians) in &rows {
+                    for (group, sample, name, depth, count, pp, pt, medians, ch_names) in &rows {
+                        ui.label(RichText::new(group).color(Color32::GRAY));
                         ui.label(sample);
                         ui.label(format!("{}{}", "  ".repeat(*depth), name));
                         ui.label(count.to_string());
                         ui.label(format!("{:.2}%", pp));
                         ui.label(format!("{:.2}%", pt));
-                        ui.label(fmt(medians.get(ci).copied().unwrap_or(f64::NAN)));
+                        let mfi = ch_names.iter().position(|c| c.eq_ignore_ascii_case(&sel_name))
+                            .and_then(|k| medians.get(k).copied()).unwrap_or(f64::NAN);
+                        ui.label(fmt(mfi));
                         ui.end_row();
                     }
                 });
@@ -1966,8 +3082,8 @@ impl FlowCytoApp {
         let mut switch_to: Option<usize> = None;
         let mut clear = false;
         let mut overlay_pick: Option<Option<usize>> = None;
-        egui::ScrollArea::vertical().max_height(160.0).id_salt("samples_scroll").show(ui, |ui| {
-            for (i, s) in self.samples.iter().enumerate() {
+        egui::ScrollArea::vertical().max_height(220.0).id_salt("samples_scroll").show(ui, |ui| {
+            for (i, s) in self.samples.iter_mut().enumerate() {
                 let low = s.n_events.map(|n| n < QC_MIN_EVENTS).unwrap_or(false);
                 let ev = s.n_events.map(fmt_count).unwrap_or_else(|| "?".into());
                 let lbl = format!("{}{}  · {} ev", if low { "⚠ " } else { "" }, s.name, ev);
@@ -1979,6 +3095,12 @@ impl FlowCytoApp {
                     if i != active && ui.selectable_label(is_ref, "👁").on_hover_text("overlay behind active sample").clicked() {
                         overlay_pick = Some(if is_ref { None } else { Some(i) });
                     }
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(14.0);
+                    ui.label(RichText::new("group:").small().color(Color32::GRAY));
+                    ui.add(egui::TextEdit::singleline(&mut s.group)
+                        .desired_width(130.0).hint_text("(condition)"));
                 });
             }
         });
@@ -2319,6 +3441,23 @@ impl FlowCytoApp {
 
 // ── Free helpers ────────────────────────────────────────────────────────────
 
+/// Compensation that doesn't borrow the app — usable from a background thread.
+/// Returns Ok(raw) when no matrix applies; Err only when a matrix exists but fails.
+fn compensate_for(fcs: &FcsFile, do_compensate: bool, ov: Option<&SpillOverride>) -> Result<Vec<f64>, String> {
+    if !do_compensate {
+        return Ok(fcs.events.clone());
+    }
+    if let Some(ov) = ov {
+        return SpilloverMatrix::from_parts(ov.channels.clone(), &ov.rows)
+            .and_then(|s| s.apply(fcs)).map_err(|e| e.to_string());
+    }
+    if let Some(kw) = fcs.spillover_keyword() {
+        return SpilloverMatrix::from_keyword(kw)
+            .and_then(|s| s.apply(fcs)).map_err(|e| e.to_string());
+    }
+    Ok(fcs.events.clone()) // no matrix present → uncompensated (legitimate)
+}
+
 /// Smooth + normalize raw bin counts per the chosen mode.
 fn normalize_hist(counts: Vec<f64>, norm: HistNorm) -> Vec<f64> {
     let counts = smooth_hist(&counts, 2);
@@ -2474,8 +3613,14 @@ fn gate_handles(shape: &GateShape) -> Vec<[f64; 2]> {
     match shape {
         GateShape::Rect { x_min, x_max, y_min, y_max } =>
             vec![[*x_min, *y_min], [*x_max, *y_min], [*x_max, *y_max], [*x_min, *y_max]],
-        GateShape::Ellipse { cx, cy, rx, ry, .. } =>
-            vec![[cx - rx, cy - ry], [cx + rx, cy - ry], [cx + rx, cy + ry], [cx - rx, cy + ry]],
+        GateShape::Ellipse { cx, cy, rx, ry, angle } => {
+            // Handles live on the ellipse's own (rotated) axes:
+            //   0 = +major, 1 = +minor, 2 = −major, 3 = −minor, 4 = rotation.
+            let (s, c) = angle.sin_cos();
+            let major = |k: f64| [cx + k * rx * c, cy + k * rx * s];
+            let minor = |k: f64| [cx - k * ry * s, cy + k * ry * c];
+            vec![major(1.0), minor(1.0), major(-1.0), minor(-1.0), major(1.35)]
+        }
         GateShape::Polygon { vertices } => vertices.clone(),
         GateShape::Range { x_min, x_max } => vec![[*x_min, 0.0], [*x_max, 0.0]],
     }
@@ -2490,15 +3635,31 @@ fn apply_gate_handle(shape: &mut GateShape, h: usize, gx: f64, gy: f64) {
             if x_min > x_max { std::mem::swap(x_min, x_max); }
             if y_min > y_max { std::mem::swap(y_min, y_max); }
         }
-        GateShape::Ellipse { cx, cy, rx, ry, .. } => {
-            // keep the diagonally-opposite corner fixed; rebuild the bounding box
-            let opp = match h { 0 => [*cx + *rx, *cy + *ry], 1 => [*cx - *rx, *cy + *ry],
-                                2 => [*cx - *rx, *cy - *ry], _ => [*cx + *rx, *cy - *ry] };
-            *cx = (gx + opp[0]) / 2.0; *cy = (gy + opp[1]) / 2.0;
-            *rx = (gx - opp[0]).abs() / 2.0; *ry = (gy - opp[1]).abs() / 2.0;
+        GateShape::Ellipse { cx, cy, rx, ry, angle } => {
+            // Center stays fixed; project the dragged point onto the ellipse's axes.
+            let (dx, dy) = (gx - *cx, gy - *cy);
+            let (s, c) = angle.sin_cos();
+            match h {
+                0 | 2 => { *rx = (dx * c + dy * s).abs().max(1e-9); }       // major axis
+                1 | 3 => { *ry = (-dx * s + dy * c).abs().max(1e-9); }      // minor axis
+                4 => { *angle = dy.atan2(dx); }                            // rotation handle
+                _ => {}
+            }
         }
         GateShape::Polygon { vertices } => { if h < vertices.len() { vertices[h] = [gx, gy]; } }
         GateShape::Range { x_min, x_max } => { if h == 0 { *x_min = gx; } else { *x_max = gx; } }
+    }
+}
+
+/// Translate an entire gate by (dx, dy) in its display coordinates.
+fn translate_shape(shape: &mut GateShape, dx: f64, dy: f64) {
+    match shape {
+        GateShape::Rect { x_min, x_max, y_min, y_max } => {
+            *x_min += dx; *x_max += dx; *y_min += dy; *y_max += dy;
+        }
+        GateShape::Ellipse { cx, cy, .. } => { *cx += dx; *cy += dy; }
+        GateShape::Polygon { vertices } => { for v in vertices { v[0] += dx; v[1] += dy; } }
+        GateShape::Range { x_min, x_max } => { *x_min += dx; *x_max += dx; }
     }
 }
 
@@ -2575,6 +3736,29 @@ fn scatter_display_range(buckets: &[Vec<[f64; 2]>]) -> ((f64, f64), (f64, f64)) 
 fn bin_of(x: f64, lo: f64, hi: f64, n: usize) -> usize {
     if hi <= lo { return 0; }
     ((x - lo) / (hi - lo) * n as f64).clamp(0.0, (n - 1) as f64) as usize
+}
+
+/// Density-sample display-space points into N_BUCKETS color buckets (shared by
+/// the single scatter and the grid cells).
+fn bucketize(dx: &[f64], dy: &[f64]) -> Vec<Vec<[f64; 2]>> {
+    let mut buckets: Vec<Vec<[f64; 2]>> = vec![Vec::new(); N_BUCKETS];
+    let nk = dx.len();
+    if nk == 0 { return buckets; }
+    let (xmin, xmax) = data_range(dx);
+    let (ymin, ymax) = data_range(dy);
+    let hist = density_hist(dx, dy, DENSITY_BINS, xmin, xmax, ymin, ymax);
+    let max_d = hist.iter().flat_map(|r| r.iter()).copied().max().unwrap_or(1).max(1);
+    let n_sample = MAX_SCATTER.min(nk);
+    let step = (nk / n_sample).max(1);
+    for k in (0..nk).step_by(step) {
+        let (x, y) = (dx[k], dy[k]);
+        let bx = bin_of(x, xmin, xmax, DENSITY_BINS);
+        let by = bin_of(y, ymin, ymax, DENSITY_BINS);
+        let t = (hist[bx][by] as f64 / max_d as f64).sqrt();
+        let b = ((t * (N_BUCKETS - 1) as f64) as usize).min(N_BUCKETS - 1);
+        buckets[b].push([x, y]);
+    }
+    buckets
 }
 
 fn density_hist(xs: &[f64], ys: &[f64], n: usize, xlo: f64, xhi: f64, ylo: f64, yhi: f64) -> Vec<Vec<u32>> {

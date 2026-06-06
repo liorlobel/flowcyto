@@ -137,6 +137,30 @@ fn med_mean_cv(vals: &mut [f64]) -> (f64, f64, f64) {
 pub const LONG_CSV_HEADER: &str =
     "sample,population,parent,depth,count,pct_parent,pct_total,channel,median,mean,cv";
 
+/// Tidy CSV header including a leading `group` column (batch export with tags).
+pub const LONG_CSV_HEADER_GROUPED: &str =
+    "group,sample,population,parent,depth,count,pct_parent,pct_total,channel,median,mean,cv";
+
+/// Like `append_long_csv`, but prepends a `group` (condition) column to every row.
+pub fn append_long_csv_grouped(out: &mut String, group: &str, sample: &str, table: &PopulationStatsTable) {
+    use std::fmt::Write;
+    let esc = |s: &str| if s.contains(',') || s.contains('"') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    };
+    for r in &table.rows {
+        for (k, ch) in table.channels.iter().enumerate() {
+            let _ = writeln!(
+                out, "{},{},{},{},{},{},{:.4},{:.4},{},{:.4},{:.4},{:.4}",
+                esc(group), esc(sample), esc(&r.name), esc(&r.parent_name), r.depth,
+                r.count, r.pct_parent, r.pct_total, esc(ch),
+                r.medians[k], r.means[k], r.cvs[k],
+            );
+        }
+    }
+}
+
 /// Append data rows (no header) for one sample to a long/tidy CSV buffer:
 /// one row per (population × channel).
 pub fn append_long_csv(out: &mut String, sample: &str, table: &PopulationStatsTable) {

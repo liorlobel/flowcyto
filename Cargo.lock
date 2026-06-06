@@ -978,6 +978,7 @@ dependencies = [
  "eframe",
  "egui",
  "egui_plot",
+ "image",
  "nalgebra",
  "rfd",
  "serde",

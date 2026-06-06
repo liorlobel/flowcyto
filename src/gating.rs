@@ -26,6 +26,10 @@ pub struct Gate {
     #[serde(default)]
     pub y_transform: AxisTransform,
     pub shape: GateShape,
+    /// Quadrant linkage: the four rects of one quadrant share a group id, so their
+    /// common center can be moved together. `None` for ordinary gates.
+    #[serde(default)]
+    pub quad_group: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
