@@ -7,8 +7,10 @@ cross-validated against R/[flowCore](https://bioconductor.org/packages/flowCore/
 
 ## Install
 
-Download **`flowcyto-<version>.dmg`** from the
-[Releases page](https://github.com/liorlobel/flowcyto/releases), drag **flowcyto**
+Grab the latest build from the
+[Releases page](https://github.com/liorlobel/flowcyto/releases).
+
+**macOS (Apple Silicon)** — download **`flowcyto-<version>.dmg`**, drag **flowcyto**
 into **Applications**, then clear Gatekeeper once on first launch (the app is
 un-notarized):
 
@@ -18,6 +20,10 @@ xattr -dr com.apple.quarantine /Applications/flowcyto.app
 
 (or right-click → Open on macOS ≤14, or "Open Anyway" in System Settings →
 Privacy & Security on macOS 15+). Full details: [INSTALL.md](INSTALL.md).
+
+**Windows (x64)** — download **`flowcyto-<version>-setup.exe`** and run it
+(Start-Menu shortcut + uninstaller). It's unsigned, so SmartScreen may warn:
+click **More info → Run anyway**.
 
 ## Tutorial: gate a sample in 5 steps
 
