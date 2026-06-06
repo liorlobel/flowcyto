@@ -27,6 +27,12 @@ use crate::transform::{AxisTransform, CompiledTransform};
 const MAX_SCATTER: usize = 20_000;
 const DENSITY_BINS: usize = 160;
 const N_BUCKETS: usize = 14;
+/// Squared normalized distance (fraction of plot size) within which a click on the
+/// first polygon vertex closes the polygon — generous so it's easy to hit.
+const POLY_CLOSE_SQ: f64 = 0.0036; // ~6% of the plot's width/height
+/// Rect/ellipse drags smaller than this (squared, normalized) are ignored, so a
+/// stray click-with-jitter doesn't create a tiny accidental gate.
+const MIN_DRAG_SQ: f64 = 0.00035; // ~1.9% of the plot's width/height
 const QC_MIN_EVENTS: usize = 5_000;   // tubes below this are flagged in the Samples list
 const REF_OVERLAY_MAX: usize = 8_000; // points drawn for a reference-overlay sample
 
@@ -304,6 +310,7 @@ pub struct FlowCytoApp {
     active_pop: Option<u32>,      // "gate from here": plot restricted to this population's events
     backgate: bool,               // show the active population's PARENT events greyed behind it
     show_contours: bool,          // overlay iso-density contour lines (Plot tab)
+    lock_view: bool,              // freeze plot pan/zoom so the view holds still while gating
     grab_handle: Option<usize>,   // which handle of the selected gate is being dragged (Edit mode)
     gate_move_last: Option<[f64; 2]>, // last cursor pos (gate-display coords) while dragging a gate body
 
@@ -363,6 +370,7 @@ impl Default for FlowCytoApp {
             active_pop: None,
             backgate: false,
             show_contours: false,
+            lock_view: true,
             grab_handle: None,
             gate_move_last: None,
             pop_stats: None,
@@ -1383,7 +1391,7 @@ impl FlowCytoApp {
         if self.draw_mode != DrawMode::Navigate {
             ui.horizontal(|ui| {
                 let hint = match self.draw_mode {
-                    DrawMode::Polygon => "click to add points",
+                    DrawMode::Polygon => "click to add points · close: click the green dot, double-click, or Finish",
                     DrawMode::Quadrant => "click to set the quadrant center",
                     DrawMode::Edit => "select a gate (■): drag handles to resize, body to move, outer handle to rotate",
                     _ => "drag on plot",
@@ -1967,10 +1975,18 @@ impl FlowCytoApp {
         let mut gate_translate: Option<(usize, f64, f64)> = None;
         let mut hover_disp: Option<[f64; 2]> = None;
         let mut dbl_drill: Option<[f64; 2]> = None;
+        // Locked view: freeze bounds to the data extent so the cell can't auto-fit/drift.
+        let lock_view = self.lock_view;
+        let view_bounds = if lock_view {
+            let (dxr, dyr) = scatter_display_range(&buckets);
+            let mx = (dxr.1 - dxr.0).abs().max(1e-9) * 0.05;
+            let my = (dyr.1 - dyr.0).abs().max(1e-9) * 0.05;
+            Some(PlotBounds::from_min_max([dxr.0 - mx, dyr.0 - my], [dxr.1 + mx, dyr.1 + my]))
+        } else { None };
 
-        let resp = Plot::new(format!("grid_{}_{}_{}_{}_{}", idx, xi, yi, cur_xt.short_label(), cur_yt.short_label()))
+        let resp = Plot::new(format!("grid_{}_{}_{}_{}_{}_{}", idx, xi, yi, cur_xt.short_label(), cur_yt.short_label(), lock_view))
             .width(cw).height(ch).allow_scroll(false)
-            .allow_drag(!drawing).allow_zoom(!drawing)
+            .allow_drag(!drawing && !lock_view).allow_zoom(!drawing && !lock_view)
             .allow_double_click_reset(false) // double-click = drill into a gate
             .x_axis_label(&x_name).y_axis_label(&y_name)
             .x_axis_formatter(move |gm: GridMark, _r| fmt_data_tick(xt_fmt.inverse(gm.value)))
@@ -1978,6 +1994,10 @@ impl FlowCytoApp {
             .x_grid_spacer(move |inp| nonlinear_grid(&xt_grid, lin_x, inp))
             .y_grid_spacer(move |inp| nonlinear_grid(&yt_grid, lin_y, inp))
             .show(ui, |pu| {
+                if let Some(b) = view_bounds {
+                    pu.set_plot_bounds(b);
+                    pu.set_auto_bounds(egui::Vec2b::new(false, false));
+                }
                 for (k, pts) in buckets.iter().enumerate() {
                     if pts.is_empty() { continue; }
                     pu.points(Points::new(PlotPoints::new(pts.clone()))
@@ -2022,22 +2042,36 @@ impl FlowCytoApp {
                             if r_dragged && is_active { if let Some(p) = ptr { next_dc = Some([p.x, p.y]); } }
                             if r_stopped && is_active {
                                 let end = ptr.map(|p| [p.x, p.y]).or(next_dc);
-                                if let (Some(s), Some(c)) = (next_ds, end) { new_shape = Some(shape_from_drag(mode, s, c)); exit_draw = true; }
+                                if let (Some(s), Some(c)) = (next_ds, end) {
+                                    let (w, h) = (bounds.width().max(1e-9), bounds.height().max(1e-9));
+                                    if ((c[0]-s[0])/w).powi(2) + ((c[1]-s[1])/h).powi(2) > MIN_DRAG_SQ {
+                                        new_shape = Some(shape_from_drag(mode, s, c)); exit_draw = true;
+                                    }
+                                }
                                 next_ds = None; next_dc = None; next_active = None;
                             }
                         }
                         DrawMode::Polygon => {
+                            let (w, h) = (bounds.width().max(1e-9), bounds.height().max(1e-9));
+                            let near_first = |p: PlotPoint| cur_poly.first()
+                                .map(|f| ((p.x - f[0])/w).powi(2) + ((p.y - f[1])/h).powi(2) < POLY_CLOSE_SQ)
+                                .unwrap_or(false);
                             if is_active && !cur_poly.is_empty() {
                                 let mut line = cur_poly.clone();
                                 if let Some(p) = ptr { line.push([p.x, p.y]); }
                                 pu.line(Line::new(PlotPoints::new(line)).color(Color32::from_rgb(240, 190, 40)).width(1.5));
                                 pu.points(Points::new(PlotPoints::new(cur_poly.clone())).radius(3.0).color(Color32::from_rgb(240, 190, 40)));
+                                // Highlight the first vertex as a close target (green when the cursor is in range).
+                                if cur_poly.len() >= 3 {
+                                    let hot = ptr.map(near_first).unwrap_or(false);
+                                    let col = if hot { Color32::from_rgb(80, 220, 120) } else { Color32::from_rgb(240, 190, 40) };
+                                    pu.points(Points::new(PlotPoints::new(vec![cur_poly[0]])).radius(if hot {7.0} else {5.0}).color(col));
+                                }
                             }
-                            if r_clicked && (is_active || (can_start && cur_poly.is_empty())) {
+                            // Place a vertex on click OR release (forgiving if the mouse moves while clicking).
+                            if (r_clicked || r_stopped) && (is_active || (can_start && cur_poly.is_empty())) {
                                 if let Some(p) = ptr {
-                                    let w = bounds.width().max(1e-9); let h = bounds.height().max(1e-9);
-                                    let close = cur_poly.first().map(|f| ((p.x - f[0]) / w).powi(2) + ((p.y - f[1]) / h).powi(2) < 0.0004).unwrap_or(false);
-                                    if close && cur_poly.len() >= 3 { poly_finish = true; }
+                                    if cur_poly.len() >= 3 && near_first(p) { poly_finish = true; }
                                     else { if cur_poly.is_empty() { next_active = Some(idx); } poly_add = Some([p.x, p.y]); }
                                 }
                             }
@@ -2206,6 +2240,9 @@ impl FlowCytoApp {
                 ui.label(RichText::new("iso-density lines").small().color(Color32::GRAY));
                 ui.separator();
             }
+            ui.checkbox(&mut self.lock_view, "🔒 Lock view")
+                .on_hover_text("Freeze pan/zoom so the plot holds still while gating (uncheck to drag-pan / pinch-zoom)");
+            ui.separator();
             ui.label("Colormap:");
             egui::ComboBox::from_id_salt("cmap").selected_text(self.colormap.label()).show_ui(ui, |ui| {
                 ui.selectable_value(&mut self.colormap, ColorMap::Viridis, "Viridis");
@@ -2294,6 +2331,15 @@ impl FlowCytoApp {
                 Some(PlotBounds::from_min_max([xlo, ylo], [xhi, yhi]))
             } else { None }
         };
+        // Locked view: freeze bounds to the data extent (+margin) so the plot can't
+        // auto-fit/drift as the rubber-band, gates, or cursor preview change.
+        let view_bounds = manual_bounds.or_else(|| {
+            if !self.lock_view { return None; }
+            let (dxr, dyr) = scatter_display_range(&buckets);
+            let mx = (dxr.1 - dxr.0).abs().max(1e-9) * 0.05;
+            let my = (dyr.1 - dyr.0).abs().max(1e-9) * 0.05;
+            Some(PlotBounds::from_min_max([dxr.0 - mx, dyr.0 - my], [dxr.1 + mx, dyr.1 + my]))
+        });
 
         // Clamp box for gate outlines so open/±∞ bounds (e.g. quadrant gates) don't
         // blow up the plot's auto-fit. Gate *membership* still uses the real bounds.
@@ -2305,6 +2351,7 @@ impl FlowCytoApp {
         };
 
         let drawing = self.draw_mode != DrawMode::Navigate;
+        let lock_view = self.lock_view;
         let mode = self.draw_mode;
 
         // Edit mode: the selected gate (if it's on the current axes), for handle dragging.
@@ -2352,14 +2399,14 @@ impl FlowCytoApp {
         // fresh plot whose auto_bounds defaults back to true (re-fits to data),
         // instead of staying frozen at the bounds we locked with set_auto_bounds(false).
         let plot = Plot::new(format!(
-            "scatter_{}_{}_{}_{}_{}_{}",
-            xi, yi, cur_xt.short_label(), cur_yt.short_label(), self.x_manual, self.y_manual
+            "scatter_{}_{}_{}_{}_{}_{}_{}",
+            xi, yi, cur_xt.short_label(), cur_yt.short_label(), self.x_manual, self.y_manual, lock_view
         ))
             .legend(Legend::default())
             .x_axis_label(&x_name)
             .y_axis_label(&y_name)
-            .allow_drag(!drawing)
-            .allow_zoom(!drawing)
+            .allow_drag(!drawing && !lock_view)
+            .allow_zoom(!drawing && !lock_view)
             .allow_scroll(false)
             .allow_double_click_reset(false) // double-click = drill into a gate
             .x_axis_formatter(move |gm: GridMark, _r| fmt_data_tick(xt_fmt.inverse(gm.value)))
@@ -2369,7 +2416,7 @@ impl FlowCytoApp {
 
         let mut dbl_drill: Option<[f64; 2]> = None;
         let plot_response = plot.show(ui, |pu| {
-            if let Some(b) = manual_bounds {
+            if let Some(b) = view_bounds {
                 pu.set_plot_bounds(b);
                 pu.set_auto_bounds(egui::Vec2b::new(false, false));
             }
@@ -2452,13 +2499,20 @@ impl FlowCytoApp {
                         if r_stopped {
                             let end = ptr.map(|p| [p.x, p.y]).or(next_dc);
                             if let (Some(s), Some(c)) = (next_ds, end) {
-                                new_shape = Some(shape_from_drag(mode, s, c));
-                                exit_draw = true;
+                                let (w, h) = (bounds.width().max(1e-9), bounds.height().max(1e-9));
+                                if ((c[0]-s[0])/w).powi(2) + ((c[1]-s[1])/h).powi(2) > MIN_DRAG_SQ {
+                                    new_shape = Some(shape_from_drag(mode, s, c));
+                                    exit_draw = true;
+                                }
                             }
                             next_ds = None; next_dc = None;
                         }
                     }
                     DrawMode::Polygon => {
+                        let (w, h) = (bounds.width().max(1e-9), bounds.height().max(1e-9));
+                        let near_first = |p: PlotPoint| cur_poly.first()
+                            .map(|f| ((p.x - f[0])/w).powi(2) + ((p.y - f[1])/h).powi(2) < POLY_CLOSE_SQ)
+                            .unwrap_or(false);
                         if !cur_poly.is_empty() {
                             let mut line: Vec<[f64; 2]> = cur_poly.clone();
                             if let Some(p) = ptr { line.push([p.x, p.y]); }
@@ -2466,15 +2520,18 @@ impl FlowCytoApp {
                                 .color(Color32::from_rgb(240, 190, 40)).width(1.5));
                             pu.points(Points::new(PlotPoints::new(cur_poly.clone()))
                                 .radius(3.0).color(Color32::from_rgb(240, 190, 40)));
+                            // Highlight the first vertex as a close target (green when the cursor is in range).
+                            if cur_poly.len() >= 3 {
+                                let hot = ptr.map(near_first).unwrap_or(false);
+                                let col = if hot { Color32::from_rgb(80, 220, 120) } else { Color32::from_rgb(240, 190, 40) };
+                                pu.points(Points::new(PlotPoints::new(vec![cur_poly[0]]))
+                                    .radius(if hot { 7.0 } else { 5.0 }).color(col));
+                            }
                         }
-                        if r_clicked {
+                        // Place a vertex on click OR release (forgiving if the mouse moves while clicking).
+                        if r_clicked || r_stopped {
                             if let Some(p) = ptr {
-                                let w = bounds.width().max(1e-9);
-                                let h = bounds.height().max(1e-9);
-                                let close = cur_poly.first().map(|f| {
-                                    ((p.x - f[0]) / w).powi(2) + ((p.y - f[1]) / h).powi(2) < 0.0004
-                                }).unwrap_or(false);
-                                if close && cur_poly.len() >= 3 { poly_finish = true; }
+                                if cur_poly.len() >= 3 && near_first(p) { poly_finish = true; }
                                 else { poly_add = Some([p.x, p.y]); }
                             }
                         }
@@ -2715,6 +2772,7 @@ impl FlowCytoApp {
             }).collect();
 
         let drawing = self.hist_draw_interval;
+        let lock_view = self.lock_view;
         let cur_ds = self.drag_start;
         let cur_dc = self.drag_current;
         let mut next_ds = cur_ds;
@@ -2731,7 +2789,7 @@ impl FlowCytoApp {
             .legend(Legend::default())
             .x_axis_label(&x_name)
             .y_axis_label(y_label)
-            .allow_drag(!drawing).allow_zoom(!drawing).allow_scroll(false)
+            .allow_drag(!drawing && !lock_view).allow_zoom(!drawing && !lock_view).allow_scroll(false)
             .x_axis_formatter(move |gm: GridMark, _r| fmt_data_tick(xt_fmt.inverse(gm.value)))
             .x_grid_spacer(move |inp| nonlinear_grid(&xt_grid, lin_x, inp));
 
