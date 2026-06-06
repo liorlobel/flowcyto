@@ -58,6 +58,9 @@ compensation — to reopen later.
 - **Spillover** tab: view/edit the compensation matrix, or compute one from
   single-stain controls; the inline **⚖ Compensation** panel on the Plot tab
   adjusts the current X↔Y spillover with a live preview.
+- **Menu bar (macOS):** native **File / Edit / View** menus mirror the in-app
+  controls — Open FCS (⌘O), Save Gates (⌘S) / Session (⇧⌘S), Undo/Redo (⌘Z / ⇧⌘Z),
+  switch tabs (⌘1–⌘5), toggle light/dark.
 - **Keyboard:** `R`/`E`/`P`/`Q` draw tools, `G` edit, `V`/`Esc` navigate,
   `Ctrl/Cmd+Z` undo, `1`–`5` switch tabs.
 - **📷 Save plot…** exports the current plot as a PNG.

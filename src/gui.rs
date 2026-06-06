@@ -323,6 +323,9 @@ pub struct FlowCytoApp {
     needs_reprocess: bool,
     needs_rescatter: bool,
     needs_regate: bool,
+
+    #[cfg(target_os = "macos")]
+    menu: Option<MenuState>, // native macOS menu bar (built once the NSApp exists)
 }
 
 impl Default for FlowCytoApp {
@@ -370,6 +373,8 @@ impl Default for FlowCytoApp {
             active_tab: ActiveTab::Plot,
             status: "Open an FCS file to begin.".into(),
             needs_reprocess: false, needs_rescatter: false, needs_regate: false,
+            #[cfg(target_os = "macos")]
+            menu: None,
         }
     }
 }
@@ -1015,6 +1020,8 @@ impl eframe::App for FlowCytoApp {
             ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
         }
 
+        #[cfg(target_os = "macos")]
+        self.handle_menu_events();
         self.poll_batch(ctx);
         self.handle_keys(ctx);
 
@@ -1085,6 +1092,45 @@ impl FlowCytoApp {
         ];
         for (t, &on) in TAB_ORDER.iter().zip(k.tabs.iter()) {
             if on { self.active_tab = *t; }
+        }
+    }
+
+    /// Dispatch native-menu clicks. Actions mirror the toolbar/keyboard exactly,
+    /// so the menu never diverges from the in-app controls.
+    #[cfg(target_os = "macos")]
+    fn handle_menu_events(&mut self) {
+        enum A { Open, SaveGates, SaveSession, LoadSession, SavePlot, Undo, Redo, Theme, Tab(usize) }
+        let mut acts: Vec<A> = Vec::new();
+        if let Some(st) = &self.menu {
+            while let Ok(ev) = muda::MenuEvent::receiver().try_recv() {
+                let id = ev.id;
+                if id == st.open { acts.push(A::Open); }
+                else if id == st.save_gates { acts.push(A::SaveGates); }
+                else if id == st.save_session { acts.push(A::SaveSession); }
+                else if id == st.load_session { acts.push(A::LoadSession); }
+                else if id == st.save_plot { acts.push(A::SavePlot); }
+                else if id == st.undo { acts.push(A::Undo); }
+                else if id == st.redo { acts.push(A::Redo); }
+                else if id == st.theme { acts.push(A::Theme); }
+                else if let Some(i) = st.tabs.iter().position(|t| *t == id) { acts.push(A::Tab(i)); }
+            }
+        }
+        const TABS: [ActiveTab; 5] = [
+            ActiveTab::Plot, ActiveTab::Histogram, ActiveTab::Stats, ActiveTab::Batch, ActiveTab::Spillover,
+        ];
+        for a in acts {
+            match a {
+                A::Open => if let Some(paths) = rfd::FileDialog::new()
+                    .add_filter("FCS files", &["fcs", "FCS"]).pick_files() { self.add_files(paths); },
+                A::SaveGates => self.save_gates(),
+                A::SaveSession => self.save_session(),
+                A::LoadSession => self.load_session(),
+                A::SavePlot => self.request_plot_png(),
+                A::Undo => self.undo(),
+                A::Redo => self.redo(),
+                A::Theme => { self.dark_mode = !self.dark_mode; self.needs_rescatter = true; }
+                A::Tab(i) => self.active_tab = TABS[i],
+            }
         }
     }
 
@@ -3830,6 +3876,89 @@ fn nonlinear_grid(ct: &CompiledTransform, linear: bool, inp: egui_plot::GridInpu
 
 // ── Entry point ────────────────────────────────────────────────────────────
 
+// ── Native macOS menu bar (muda) ─────────────────────────────────────────────
+
+/// Menu item ids we dispatch on. Holds the live `Menu` so the native menu isn't
+/// torn down. Actions mirror the in-app toolbar/keyboard so nothing diverges.
+#[cfg(target_os = "macos")]
+struct MenuState {
+    _menu: muda::Menu,
+    open: muda::MenuId,
+    save_gates: muda::MenuId,
+    save_session: muda::MenuId,
+    load_session: muda::MenuId,
+    save_plot: muda::MenuId,
+    undo: muda::MenuId,
+    redo: muda::MenuId,
+    theme: muda::MenuId,
+    tabs: [muda::MenuId; 5], // Plot, Histogram, Stats, Batch, Spillover
+}
+
+#[cfg(target_os = "macos")]
+fn build_menu() -> MenuState {
+    use muda::{accelerator::Accelerator, AboutMetadata, IsMenuItem, Menu, MenuItem,
+               PredefinedMenuItem, Submenu};
+    let acc = |s: &str| s.parse::<Accelerator>().ok();
+    let menu = Menu::new();
+
+    // Application menu (About / Hide / Quit).
+    let app_m = Submenu::new("flowcyto", true);
+    let about = PredefinedMenuItem::about(Some("About flowcyto"), Some(AboutMetadata {
+        name: Some("flowcyto".into()),
+        version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        ..Default::default()
+    }));
+    let _ = app_m.append_items(&[
+        &about, &PredefinedMenuItem::separator(),
+        &PredefinedMenuItem::hide(None), &PredefinedMenuItem::quit(None),
+    ]);
+
+    // File.
+    let file_m = Submenu::new("File", true);
+    let open = MenuItem::new("Open FCS…", true, acc("CmdOrCtrl+O"));
+    let save_gates = MenuItem::new("Save Gates…", true, acc("CmdOrCtrl+S"));
+    let save_session = MenuItem::new("Save Session…", true, acc("CmdOrCtrl+Shift+S"));
+    let load_session = MenuItem::new("Load Session…", true, None);
+    let save_plot = MenuItem::new("Save Plot as PNG…", true, None);
+    let _ = file_m.append_items(&[
+        &open, &PredefinedMenuItem::separator(),
+        &save_gates, &save_session, &load_session,
+        &PredefinedMenuItem::separator(), &save_plot,
+    ]);
+
+    // Edit.
+    let edit_m = Submenu::new("Edit", true);
+    let undo = MenuItem::new("Undo", true, acc("CmdOrCtrl+Z"));
+    let redo = MenuItem::new("Redo", true, acc("CmdOrCtrl+Shift+Z"));
+    let _ = edit_m.append_items(&[&undo, &redo]);
+
+    // View (tab switches + theme).
+    let view_m = Submenu::new("View", true);
+    let names = ["Plot", "Histogram", "Stats", "Batch", "Spillover"];
+    let tab_items: Vec<MenuItem> = names.iter().enumerate()
+        .map(|(i, n)| MenuItem::new(*n, true, acc(&format!("CmdOrCtrl+{}", i + 1)))).collect();
+    let theme = MenuItem::new("Toggle Light/Dark", true, None);
+    let tab_refs: Vec<&dyn IsMenuItem> = tab_items.iter().map(|m| m as &dyn IsMenuItem).collect();
+    let _ = view_m.append_items(&tab_refs);
+    let _ = view_m.append_items(&[&PredefinedMenuItem::separator() as &dyn IsMenuItem, &theme]);
+
+    let _ = menu.append_items(&[&app_m, &file_m, &edit_m, &view_m]);
+    menu.init_for_nsapp();
+
+    MenuState {
+        open: open.id().clone(),
+        save_gates: save_gates.id().clone(),
+        save_session: save_session.id().clone(),
+        load_session: load_session.id().clone(),
+        save_plot: save_plot.id().clone(),
+        undo: undo.id().clone(),
+        redo: redo.id().clone(),
+        theme: theme.id().clone(),
+        tabs: std::array::from_fn(|i| tab_items[i].id().clone()),
+        _menu: menu,
+    }
+}
+
 /// One-time style setup: spacing, padding, rounded widgets, readable text sizes.
 /// (Spacing/text persist across the per-frame `set_visuals` calls.)
 fn setup_style(ctx: &egui::Context) {
@@ -3876,6 +4005,8 @@ pub fn run_gui(initial_file: Option<&Path>) {
         setup_style(&cc.egui_ctx);
         let mut app = FlowCytoApp::default();
         if let Some(p) = initial_file { app.load_file(p); }
+        #[cfg(target_os = "macos")]
+        { app.menu = Some(build_menu()); }
         Ok(Box::new(app))
     })).expect("failed to launch GUI");
 }
