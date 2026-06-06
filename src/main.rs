@@ -1,6 +1,10 @@
 // Numeric/matrix code indexes intentionally (matrix multiply, event offsets,
 // 2-D grids); a few CLI handlers and display tuples are inherently wide.
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments, clippy::type_complexity)]
+// On Windows release builds, use the GUI subsystem so no console window flashes
+// when the app is launched from a shortcut. (CLI use re-attaches the parent
+// console at startup — see `maybe_attach_console`.)
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
 mod compensation;
 mod fcs;
@@ -172,7 +176,21 @@ enum TransformArg {
 
 // ── Entry point ───────────────────────────────────────────────────────────
 
+/// On Windows the binary is built for the GUI subsystem (no console), so when it
+/// is run from a terminal with CLI arguments we reattach to the parent console
+/// so stdout/stderr are visible. No-op elsewhere / for the GUI.
+#[cfg(windows)]
+fn maybe_attach_console() {
+    if std::env::args().len() > 1 {
+        use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+        let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+    }
+}
+
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    maybe_attach_console();
+
     // If no subcommand was given, open the GUI directly.
     let args: Vec<String> = std::env::args().collect();
     if args.len() <= 1 {
