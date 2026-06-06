@@ -11,7 +11,7 @@ cd /Users/liorlobel/flowcyto && /opt/homebrew/bin/rustup run stable cargo build 
 ```
 - Binary: `target/release/flowcyto`
 - GUI: `flowcyto gui <file.fcs>`  (or `flowcyto` with no args → GUI)
-- Always finish with: `cargo build --release` clean, `cargo clippy --release` = **0 warnings**, `cargo test --release` = **2 logicle tests pass**.
+- Always finish with: `cargo build --release` clean, `cargo clippy --release --all-targets` = **0 warnings**, `cargo test --release` = **88 tests pass** (84 unit + 4 CLI integration). Unit tests live inline (`#[cfg(test)] mod tests`) in each module; `src/test_util.rs` is a `cfg(test)`-only in-memory `FcsFile` builder; `tests/cli.rs` drives the real binary against `tests/fixtures/tiny.fcs`. Add a regression test alongside any numeric change.
 
 ## Architecture (src/)
 | file | role |

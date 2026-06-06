@@ -334,3 +334,242 @@ impl SpilloverMatrix {
         Ok(events)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::make_fcs;
+
+    // ── parse / format round-trip ──────────────────────────────────────────
+
+    #[test]
+    fn parse_spillover_basic() {
+        let (chans, rows) = parse_spillover("2,FITC-A,PE-A,1,0.21,0.05,1").unwrap();
+        assert_eq!(chans, vec!["FITC-A", "PE-A"]);
+        assert_eq!(rows, vec![vec![1.0, 0.21], vec![0.05, 1.0]]);
+    }
+
+    #[test]
+    fn parse_format_round_trip() {
+        let chans = vec!["FITC-A".to_string(), "PE-A".to_string()];
+        let rows = vec![vec![1.0, 0.21], vec![0.05, 1.0]];
+        let kw = format_spillover(&chans, &rows);
+        let (c2, r2) = parse_spillover(&kw).unwrap();
+        assert_eq!(c2, chans);
+        assert_eq!(r2, rows);
+    }
+
+    #[test]
+    fn parse_spillover_too_few_tokens_errors() {
+        // n=3 needs 1 + 3 + 9 = 13 tokens; supply far fewer.
+        assert!(parse_spillover("3,A,B,C,1,0,0").is_err());
+    }
+
+    #[test]
+    fn parse_spillover_bad_n_errors() {
+        assert!(parse_spillover("notanint,A,1").is_err());
+    }
+
+    // ── compute_spillover: synthetic ground-truth recovery ─────────────────
+
+    /// Build a single-stain control: brightest in channel `primary`, with a
+    /// known spillover fraction `spill` into the *other* channel, on top of a
+    /// constant background. Two events per file keeps the median exact.
+    fn stain(primary: usize, signal: f64, spill: f64, bg: f64) -> FcsFile {
+        let other = 1 - primary;
+        let mut a = vec![bg, bg];
+        let mut b = vec![bg, bg];
+        a[primary] += signal;
+        a[other] += signal * spill;
+        b[primary] += signal;
+        b[other] += signal * spill;
+        make_fcs(&["FITC-A", "PE-A"], &[a, b])
+    }
+
+    #[test]
+    fn compute_spillover_recovers_known_matrix() {
+        let bg = 100.0;
+        let unstained = make_fcs(&["FITC-A", "PE-A"], &[vec![bg, bg], vec![bg, bg]]);
+        // FITC control spills 0.20 into PE; PE control spills 0.08 into FITC.
+        let fitc = stain(0, 1000.0, 0.20, bg);
+        let pe = stain(1, 1000.0, 0.08, bg);
+
+        let res = compute_spillover(
+            &["FITC-A".into(), "PE-A".into()],
+            &unstained,
+            &[&fitc, &pe],
+        )
+        .unwrap();
+
+        assert_eq!(res.assigned, vec![0, 1], "intensity-based assignment");
+        // Row 0 (FITC primary): [1, 0.20]; row 1 (PE primary): [0.08, 1].
+        assert!((res.rows[0][0] - 1.0).abs() < 1e-9);
+        assert!((res.rows[0][1] - 0.20).abs() < 1e-9);
+        assert!((res.rows[1][0] - 0.08).abs() < 1e-9);
+        assert!((res.rows[1][1] - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn compute_spillover_wrong_control_count_errors() {
+        let unstained = make_fcs(&["FITC-A", "PE-A"], &[vec![0.0, 0.0]]);
+        let fitc = stain(0, 1000.0, 0.2, 0.0);
+        // Two channels but only one control.
+        assert!(compute_spillover(
+            &["FITC-A".into(), "PE-A".into()],
+            &unstained,
+            &[&fitc]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn compute_spillover_two_controls_same_channel_errors() {
+        let bg = 0.0;
+        let unstained = make_fcs(&["FITC-A", "PE-A"], &[vec![bg, bg]]);
+        let a = stain(0, 1000.0, 0.1, bg);
+        let b = stain(0, 900.0, 0.1, bg); // also brightest in FITC
+        assert!(compute_spillover(
+            &["FITC-A".into(), "PE-A".into()],
+            &unstained,
+            &[&a, &b]
+        )
+        .is_err());
+    }
+
+    // ── SpilloverMatrix: invert + apply ────────────────────────────────────
+
+    #[test]
+    fn from_parts_singular_errors() {
+        // Linearly dependent rows → singular → cannot invert.
+        let chans = vec!["A".to_string(), "B".to_string()];
+        let rows = vec![vec![1.0, 1.0], vec![1.0, 1.0]];
+        assert!(SpilloverMatrix::from_parts(chans, &rows).is_err());
+    }
+
+    #[test]
+    fn apply_identity_is_noop() {
+        let fcs = make_fcs(&["FITC-A", "PE-A"], &[vec![10.0, 20.0], vec![30.0, 40.0]]);
+        let m = SpilloverMatrix::from_parts(
+            vec!["FITC-A".into(), "PE-A".into()],
+            &[vec![1.0, 0.0], vec![0.0, 1.0]],
+        )
+        .unwrap();
+        let out = m.apply(&fcs).unwrap();
+        assert_eq!(out, fcs.events);
+    }
+
+    #[test]
+    fn apply_inverts_known_spillover() {
+        // Forward-mix raw signal through M, then compensate back to the truth.
+        // flowCore convention: comp = raw × M⁻¹, and observed raw = true × M.
+        let truth = [1000.0f64, 0.0];
+        let s = [[1.0, 0.20], [0.08, 1.0]];
+        // observed[j] = Σ_i true[i] * s[i][j]
+        let obs0 = truth[0] * s[0][0] + truth[1] * s[1][0];
+        let obs1 = truth[0] * s[0][1] + truth[1] * s[1][1];
+        let fcs = make_fcs(&["FITC-A", "PE-A"], &[vec![obs0, obs1]]);
+
+        let m = SpilloverMatrix::from_parts(
+            vec!["FITC-A".into(), "PE-A".into()],
+            &[s[0].to_vec(), s[1].to_vec()],
+        )
+        .unwrap();
+        let out = m.apply(&fcs).unwrap();
+        assert!((out[0] - truth[0]).abs() < 1e-6, "got {}", out[0]);
+        assert!((out[1] - truth[1]).abs() < 1e-6, "got {}", out[1]);
+    }
+
+    #[test]
+    fn apply_leaves_unlisted_channels_untouched() {
+        // FSC-A is not in the spillover matrix; it must pass through unchanged.
+        let fcs = make_fcs(
+            &["FSC-A", "FITC-A", "PE-A"],
+            &[vec![500.0, 10.0, 20.0]],
+        );
+        let m = SpilloverMatrix::from_parts(
+            vec!["FITC-A".into(), "PE-A".into()],
+            &[vec![1.0, 0.5], vec![0.0, 1.0]],
+        )
+        .unwrap();
+        let out = m.apply(&fcs).unwrap();
+        assert_eq!(out[0], 500.0, "FSC-A must be untouched");
+    }
+
+    #[test]
+    fn apply_unknown_channel_errors() {
+        let fcs = make_fcs(&["FITC-A"], &[vec![1.0]]);
+        let m = SpilloverMatrix::from_parts(
+            vec!["NONEXISTENT".into()],
+            &[vec![1.0]],
+        )
+        .unwrap();
+        assert!(m.apply(&fcs).is_err());
+    }
+
+    // ── matrix file IO ─────────────────────────────────────────────────────
+
+    #[test]
+    fn matrix_file_csv_round_trip() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("flowcyto_test_{}.csv", std::process::id()));
+        let chans = vec!["FITC-A".to_string(), "PE-A".to_string()];
+        let rows = vec![vec![1.0, 0.21], vec![0.05, 1.0]];
+        save_matrix_file(&path, &chans, &rows).unwrap();
+        let (c2, r2) = load_matrix_file(&path).unwrap();
+        assert_eq!(c2, chans);
+        assert_eq!(r2, rows);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn matrix_file_json_round_trip() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("flowcyto_test_{}.json", std::process::id()));
+        let chans = vec!["FITC-A".to_string(), "PE-A".to_string()];
+        let rows = vec![vec![1.0, 0.21], vec![0.05, 1.0]];
+        save_matrix_file(&path, &chans, &rows).unwrap();
+        let (c2, r2) = load_matrix_file(&path).unwrap();
+        assert_eq!(c2, chans);
+        assert_eq!(r2, rows);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_square_rejects_non_square() {
+        let chans = vec!["A".to_string(), "B".to_string()];
+        let rows = vec![vec![1.0, 0.0]]; // only 1 row for 2 channels
+        assert!(validate_square(&chans, &rows).is_err());
+    }
+
+    // ── small helpers ──────────────────────────────────────────────────────
+
+    #[test]
+    fn max_off_diagonal_ignores_diagonal() {
+        let rows = vec![vec![1.0, 0.3], vec![-0.4, 1.0]];
+        assert!((max_off_diagonal(&rows) - 0.4).abs() < 1e-12);
+    }
+
+    #[test]
+    fn fluor_token_longest_match_wins() {
+        let chans = vec!["PE-A".to_string(), "PE-Cy7-A".to_string()];
+        // Filename contains both "PE" and "PE-Cy7"; longest must win → index 1.
+        let idx = fluor_token_in_filename(&chans, "Tube_PE-Cy7_control.fcs");
+        assert_eq!(idx, Some(1));
+    }
+
+    #[test]
+    fn fluor_token_none_when_absent() {
+        let chans = vec!["FITC-A".to_string()];
+        assert_eq!(fluor_token_in_filename(&chans, "unstained.fcs"), None);
+    }
+
+    #[test]
+    fn median_even_and_odd() {
+        let mut odd = [3.0, 1.0, 2.0];
+        assert_eq!(median(&mut odd), 2.0);
+        let mut even = [4.0, 1.0, 3.0, 2.0];
+        assert_eq!(median(&mut even), 2.5);
+        let mut empty: [f64; 0] = [];
+        assert_eq!(median(&mut empty), 0.0);
+    }
+}

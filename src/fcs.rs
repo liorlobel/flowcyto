@@ -348,3 +348,219 @@ fn parse_data(
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(index: usize, name: &str, bits: u32, range: f64) -> Parameter {
+        Parameter { index, name: name.to_string(), label: None, range, bits }
+    }
+
+    // ── parse_text ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_text_basic() {
+        // First byte is the delimiter ('/').
+        let buf = b"/$PAR/2/$TOT/5/";
+        let kw = parse_text(buf).unwrap();
+        assert_eq!(kw.get("$PAR").unwrap(), "2");
+        assert_eq!(kw.get("$TOT").unwrap(), "5");
+    }
+
+    #[test]
+    fn parse_text_uppercases_keys() {
+        let buf = b"/$par/9/";
+        let kw = parse_text(buf).unwrap();
+        assert_eq!(kw.get("$PAR").unwrap(), "9");
+    }
+
+    #[test]
+    fn parse_text_double_delimiter_escape() {
+        // A doubled delimiter inside a value is a literal delimiter (§3.2.3).
+        // value "a/b" is encoded as "a//b".
+        let buf = b"/KEY/a//b/";
+        let kw = parse_text(buf).unwrap();
+        assert_eq!(kw.get("KEY").unwrap(), "a/b");
+    }
+
+    #[test]
+    fn parse_text_empty_errors() {
+        assert!(parse_text(b"").is_err());
+    }
+
+    // ── parse_hdr_offset ───────────────────────────────────────────────────
+
+    #[test]
+    fn hdr_offset_parses_and_trims() {
+        assert_eq!(parse_hdr_offset(b"      58").unwrap(), 58);
+        assert_eq!(parse_hdr_offset(b"        ").unwrap(), 0); // blank → 0
+        assert!(parse_hdr_offset(b"   12x  ").is_err());
+    }
+
+    // ── parse_data: float ──────────────────────────────────────────────────
+
+    fn f32le(vals: &[f64]) -> Vec<u8> {
+        vals.iter().flat_map(|&v| (v as f32).to_le_bytes()).collect()
+    }
+    fn f32be(vals: &[f64]) -> Vec<u8> {
+        vals.iter().flat_map(|&v| (v as f32).to_be_bytes()).collect()
+    }
+
+    #[test]
+    fn parse_data_float_little_endian() {
+        let params = [p(1, "A", 32, 0.0), p(2, "B", 32, 0.0)];
+        let buf = f32le(&[1.0, 2.0, 3.0, 4.0]);
+        let out = parse_data(&buf, 2, 2, "F", true, &params).unwrap();
+        assert_eq!(out, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn parse_data_float_big_endian() {
+        let params = [p(1, "A", 32, 0.0), p(2, "B", 32, 0.0)];
+        let buf = f32be(&[1.0, 2.0, 3.0, 4.0]);
+        let out = parse_data(&buf, 2, 2, "F", false, &params).unwrap();
+        assert_eq!(out, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn parse_data_double() {
+        let params = [p(1, "A", 64, 0.0)];
+        let buf: Vec<u8> = [1.5f64, 2.5].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let out = parse_data(&buf, 1, 2, "D", true, &params).unwrap();
+        assert_eq!(out, vec![1.5, 2.5]);
+    }
+
+    #[test]
+    fn parse_data_integer_16bit() {
+        // 16-bit unsigned LE, range a power of two so the mask is transparent.
+        let params = [p(1, "A", 16, 65536.0)];
+        let buf: Vec<u8> = [300u16, 1000].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let out = parse_data(&buf, 1, 2, "I", true, &params).unwrap();
+        assert_eq!(out, vec![300.0, 1000.0]);
+    }
+
+    #[test]
+    fn parse_data_integer_range_bitmask() {
+        // Classic 12-bit FACSCalibur data: $PnR = 1024 masks to 10 bits (0..1023).
+        // 5000 & 1023 = 904.
+        let params = [p(1, "A", 16, 1024.0)];
+        let buf: Vec<u8> = [5000u16].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let out = parse_data(&buf, 1, 1, "I", true, &params).unwrap();
+        assert_eq!(out, vec![904.0]);
+    }
+
+    #[test]
+    fn parse_data_unsupported_datatype_errors() {
+        let params = [p(1, "A", 32, 0.0)];
+        assert!(parse_data(b"\0\0\0\0", 1, 1, "A", true, &params).is_err());
+        assert!(parse_data(b"\0\0\0\0", 1, 1, "Z", true, &params).is_err());
+    }
+
+    // ── full file: build → open round-trip ─────────────────────────────────
+
+    /// Assemble a complete FCS3.0 byte image (header + TEXT + DATA).
+    fn build_fcs(text_kw: &[(&str, &str)], data: &[u8]) -> Vec<u8> {
+        let delim = b'/';
+        let mut text = vec![delim];
+        for (k, v) in text_kw {
+            text.extend_from_slice(k.as_bytes());
+            text.push(delim);
+            text.extend_from_slice(v.as_bytes());
+            text.push(delim);
+        }
+        let text_start = 58usize;
+        let text_end = text_start + text.len() - 1;
+        let data_start = text_end + 1;
+        let data_end = data_start + data.len() - 1;
+
+        let mut hdr = vec![b' '; 58];
+        hdr[0..6].copy_from_slice(b"FCS3.0");
+        let mut put = |range: std::ops::Range<usize>, v: usize| {
+            let s = format!("{:>8}", v);
+            hdr[range].copy_from_slice(s.as_bytes());
+        };
+        put(10..18, text_start);
+        put(18..26, text_end);
+        put(26..34, data_start);
+        put(34..42, data_end);
+        put(42..50, 0);
+        put(50..58, 0);
+
+        let mut out = hdr;
+        out.extend_from_slice(&text);
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn write_temp(bytes: &[u8], tag: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir()
+            .join(format!("flowcyto_fcs_{}_{}.fcs", std::process::id(), tag));
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn standard_kw() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("$PAR", "2"),
+            ("$TOT", "2"),
+            ("$DATATYPE", "F"),
+            ("$BYTEORD", "1,2,3,4"),
+            ("$MODE", "L"),
+            ("$P1N", "FSC-A"),
+            ("$P1B", "32"),
+            ("$P1R", "262144"),
+            ("$P2N", "FITC-A"),
+            ("$P2B", "32"),
+            ("$P2R", "262144"),
+            ("$SPILLOVER", "1,FITC-A,1"),
+        ]
+    }
+
+    #[test]
+    fn open_round_trip() {
+        let data = f32le(&[10.0, 100.0, 20.0, 200.0]); // 2 events × 2 params
+        let bytes = build_fcs(&standard_kw(), &data);
+        let path = write_temp(&bytes, "rt");
+
+        let fcs = FcsFile::open(&path).unwrap();
+        assert_eq!(fcs.version, "FCS3.0");
+        assert_eq!(fcs.n_params(), 2);
+        assert_eq!(fcs.n_events, 2);
+        assert_eq!(fcs.events, vec![10.0, 100.0, 20.0, 200.0]);
+        assert_eq!(fcs.param_index("fitc-a"), Some(1)); // case-insensitive
+        assert_eq!(fcs.channel_values(1), vec![100.0, 200.0]);
+        assert_eq!(fcs.event_slice(0), &[10.0, 100.0]);
+        assert_eq!(fcs.spillover_keyword(), Some("1,FITC-A,1"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn peek_events_reads_tot_only() {
+        let data = f32le(&[10.0, 100.0, 20.0, 200.0]);
+        let bytes = build_fcs(&standard_kw(), &data);
+        let path = write_temp(&bytes, "peek");
+        assert_eq!(FcsFile::peek_events(&path).unwrap(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_rejects_non_fcs_magic() {
+        let path = write_temp(b"NOTANFCSFILE........................................................", "magic");
+        assert!(FcsFile::open(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_rejects_corrupt_text_offsets() {
+        // text_end < text_start triggers the corrupt-header bail.
+        let data = f32le(&[1.0, 2.0, 3.0, 4.0]);
+        let mut bytes = build_fcs(&standard_kw(), &data);
+        // Overwrite text_end (bytes 18..26) with a value smaller than text_start.
+        bytes[18..26].copy_from_slice(b"      10");
+        let path = write_temp(&bytes, "corrupt");
+        assert!(FcsFile::open(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+}
