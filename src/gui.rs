@@ -281,7 +281,9 @@ pub struct FlowCytoApp {
     y_hi: f64,
 
     scatter: Option<ScatterCache>,
-    grid_mode: bool,                  // Plot tab: show a 2×2 grid of plots
+    grid_mode: bool,                  // Plot tab: show a grid of plots
+    grid_cols: usize,                 // grid columns (1..=6)
+    grid_rows: usize,                 // grid rows (1..=6)
     grid_channels: Vec<(usize, usize)>, // per-cell (x, y) channel indices
     grid_cache: Vec<Option<GridCell>>,  // per-cell density-bucket cache
     active_grid_cell: Option<usize>,    // cell index owning the in-progress draw gesture
@@ -347,6 +349,8 @@ impl Default for FlowCytoApp {
             y_manual: false, y_lo: 0.0, y_hi: 262144.0,
             scatter: None,
             grid_mode: false,
+            grid_cols: 2,
+            grid_rows: 2,
             grid_channels: vec![(0, 1), (0, 2), (0, 3), (1, 2)],
             grid_cache: vec![None, None, None, None],
             active_grid_cell: None,
@@ -556,7 +560,18 @@ impl FlowCytoApp {
 
     /// Density buckets for an arbitrary channel pair (grid cells). Respects the
     /// active "gate from here" population, same as the main scatter.
-    fn compute_cell_buckets(&self, xi: usize, yi: usize) -> Vec<Vec<[f64; 2]>> {
+    /// Event indices shown in the grid: the active "gate from here" population, or
+    /// all events. Computed once per frame and shared across cells (it's the only
+    /// expensive shared step, so we avoid recomputing it per cell).
+    fn grid_kept(&self) -> Vec<usize> {
+        let n_events = self.fcs.as_ref().map(|f| f.n_events).unwrap_or(0);
+        match self.active_pop.map(|p| self.pop_mask(p)) {
+            Some(m) => (0..n_events).filter(|&e| m.get(e).copied().unwrap_or(false)).collect(),
+            None => (0..n_events).collect(),
+        }
+    }
+
+    fn compute_cell_buckets(&self, xi: usize, yi: usize, kept: &[usize], cap: usize) -> Vec<Vec<[f64; 2]>> {
         let (n_events, n_params) = match &self.fcs {
             Some(f) => (f.n_events, f.n_params()), None => return Vec::new(),
         };
@@ -567,13 +582,9 @@ impl FlowCytoApp {
         let yi = yi.min(n_params - 1);
         let xt = self.cur_tf(xi).compile();
         let yt = self.cur_tf(yi).compile();
-        let kept: Vec<usize> = match self.active_pop.map(|p| self.pop_mask(p)) {
-            Some(m) => (0..n_events).filter(|&e| m.get(e).copied().unwrap_or(false)).collect(),
-            None => (0..n_events).collect(),
-        };
         let dx: Vec<f64> = kept.iter().map(|&e| xt.forward(self.compensated[e * n_params + xi])).collect();
         let dy: Vec<f64> = kept.iter().map(|&e| yt.forward(self.compensated[e * n_params + yi])).collect();
-        bucketize(&dx, &dy)
+        bucketize(&dx, &dy, cap)
     }
 
     /// The gate drawn on channels (x_base, y_base) whose shape contains the plot
@@ -1797,7 +1808,7 @@ impl FlowCytoApp {
         });
     }
 
-    // ── 2×2 grid of plots ─────────────────────────────────────────────
+    // ── Adjustable grid of plots (up to 6×6) ──────────────────────────
 
     fn grid_view(&mut self, ui: &mut egui::Ui) {
         // Clear any stuck gesture owner when not actively drawing (Esc/Cancel/tool-
@@ -1806,23 +1817,45 @@ impl FlowCytoApp {
         if self.draw_mode == DrawMode::Navigate { self.active_grid_cell = None; }
         ui.label(RichText::new("Each cell has its own X/Y. Pick a draw tool (left), then draw/edit gates in any cell; “gate from here” drills all cells.")
             .small().color(Color32::GRAY));
+
+        let cols = self.grid_cols.clamp(1, 6);
+        let rows = self.grid_rows.clamp(1, 6);
+        let n = cols * rows;
+        let n_params = self.fcs.as_ref().map(|f| f.n_params()).unwrap_or(1).max(1);
+        // Grow per-cell state to fit the grid; new cells get varied default pairs.
+        while self.grid_channels.len() < n {
+            let k = self.grid_channels.len();
+            self.grid_channels.push((0, (k + 1).min(n_params - 1)));
+        }
+        while self.grid_cache.len() < n { self.grid_cache.push(None); }
+
+        // Point budget per cell: keep the whole grid's drawn points bounded so
+        // large grids stay smooth (cells are small, so fewer points still read well).
+        let cap = (30_000 / n).clamp(800, MAX_SCATTER);
+
         let avail = ui.available_size();
-        let cw = (avail.x / 2.0 - 8.0).max(120.0);
-        // Reserve room for two header rows per cell (channels + scale pickers).
-        let ch = (avail.y / 2.0 - 60.0).max(90.0);
-        for row in 0..2 {
+        let gap = 8.0;
+        let cw = (avail.x / cols as f32 - gap).max(110.0);
+        // Reserve room for the two header rows (channels + scale pickers) per cell.
+        const HEADER: f32 = 56.0;
+        let ch = (avail.y / rows as f32 - HEADER).max(70.0);
+
+        // Compute the shared kept-event list at most once per frame, only if a cell
+        // actually rebuilds (avoids per-frame mask recompute when everything's cached).
+        let mut kept: Option<Vec<usize>> = None;
+        for row in 0..rows {
             ui.horizontal(|ui| {
-                for col in 0..2 {
-                    let idx = row * 2 + col;
-                    ui.allocate_ui(egui::vec2(cw, ch + 56.0), |ui| {
-                        ui.vertical(|ui| { self.grid_cell(ui, idx, cw, ch); });
+                for col in 0..cols {
+                    let idx = row * cols + col;
+                    ui.allocate_ui(egui::vec2(cw, ch + HEADER), |ui| {
+                        ui.vertical(|ui| { self.grid_cell(ui, idx, cw, ch, cap, &mut kept); });
                     });
                 }
             });
         }
     }
 
-    fn grid_cell(&mut self, ui: &mut egui::Ui, idx: usize, cw: f32, ch: f32) {
+    fn grid_cell(&mut self, ui: &mut egui::Ui, idx: usize, cw: f32, ch: f32, cap: usize, kept: &mut Option<Vec<usize>>) {
         let n_params = self.fcs.as_ref().map(|f| f.n_params()).unwrap_or(1).max(1);
         if idx >= self.grid_channels.len() { return; }
         let (mut xi, mut yi) = self.grid_channels[idx];
@@ -1860,7 +1893,8 @@ impl FlowCytoApp {
                 || c.x_label != cur_xt.short_label() || c.y_label != cur_yt.short_label()
         }).unwrap_or(true);
         if stale {
-            let buckets = self.compute_cell_buckets(xi, yi);
+            let k = kept.get_or_insert_with(|| self.grid_kept());
+            let buckets = self.compute_cell_buckets(xi, yi, k, cap);
             self.grid_cache[idx] = Some(GridCell {
                 xi, yi, x_label: cur_xt.short_label().to_string(),
                 y_label: cur_yt.short_label().to_string(),
@@ -2153,8 +2187,19 @@ impl FlowCytoApp {
         // plot controls
         ui.horizontal(|ui| {
             ui.label("Layout:");
+            let was_grid = self.grid_mode;
             ui.selectable_value(&mut self.grid_mode, false, "Single");
-            ui.selectable_value(&mut self.grid_mode, true, "2×2 grid");
+            ui.selectable_value(&mut self.grid_mode, true, "Grid");
+            if self.grid_mode {
+                let (c0, r0) = (self.grid_cols, self.grid_rows);
+                ui.add(egui::DragValue::new(&mut self.grid_cols).range(1..=6).speed(0.05).prefix("cols "));
+                ui.label("×");
+                ui.add(egui::DragValue::new(&mut self.grid_rows).range(1..=6).speed(0.05).prefix("rows "));
+                // Cell point-budgets change with grid size → rebuild all cells.
+                if was_grid != self.grid_mode || self.grid_cols != c0 || self.grid_rows != r0 {
+                    self.grid_cache.iter_mut().for_each(|c| *c = None);
+                }
+            }
             ui.separator();
             if !self.grid_mode {
                 if ui.checkbox(&mut self.show_contours, "Contours").changed() { self.scatter = None; }
@@ -3801,8 +3846,9 @@ fn bin_of(x: f64, lo: f64, hi: f64, n: usize) -> usize {
 }
 
 /// Density-sample display-space points into N_BUCKETS color buckets (shared by
-/// the single scatter and the grid cells).
-fn bucketize(dx: &[f64], dy: &[f64]) -> Vec<Vec<[f64; 2]>> {
+/// the single scatter and the grid cells). `cap` bounds the points drawn so dense
+/// grids (up to 36 cells) stay responsive.
+fn bucketize(dx: &[f64], dy: &[f64], cap: usize) -> Vec<Vec<[f64; 2]>> {
     let mut buckets: Vec<Vec<[f64; 2]>> = vec![Vec::new(); N_BUCKETS];
     let nk = dx.len();
     if nk == 0 { return buckets; }
@@ -3810,7 +3856,7 @@ fn bucketize(dx: &[f64], dy: &[f64]) -> Vec<Vec<[f64; 2]>> {
     let (ymin, ymax) = data_range(dy);
     let hist = density_hist(dx, dy, DENSITY_BINS, xmin, xmax, ymin, ymax);
     let max_d = hist.iter().flat_map(|r| r.iter()).copied().max().unwrap_or(1).max(1);
-    let n_sample = MAX_SCATTER.min(nk);
+    let n_sample = cap.max(1).min(nk);
     let step = (nk / n_sample).max(1);
     for k in (0..nk).step_by(step) {
         let (x, y) = (dx[k], dy[k]);
