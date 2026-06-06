@@ -99,6 +99,28 @@ rm -f "$DMG"
 STAGE="$(mktemp -d)"
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
+# Gatekeeper instructions visible right inside the disk image.
+cat > "$STAGE/Open Me First.txt" <<'TXT'
+Installing flowcyto
+===================
+
+1. Drag "flowcyto" onto the Applications folder.
+
+2. First launch — macOS will warn because the app is not notarized.
+   Clear it once (pick one):
+
+   • Terminal (most reliable, any macOS):
+       xattr -dr com.apple.quarantine /Applications/flowcyto.app
+     then open flowcyto from Applications.
+
+   • macOS 14 and earlier: right-click flowcyto in Applications -> Open -> Open.
+
+   • macOS 15 (Sequoia) and later: double-click it, then go to
+     System Settings -> Privacy & Security -> "Open Anyway".
+
+This is expected for an un-notarized app and only needs to be done once.
+Full notes: see INSTALL.md in the project.
+TXT
 hdiutil create -volname "$APP_NAME $VERSION" -srcfolder "$STAGE" \
   -ov -format UDZO "$DMG" >/dev/null
 rm -rf "$STAGE"
@@ -109,4 +131,6 @@ echo "    $ROOT/$APP"
 echo "    $ROOT/$DMG"
 echo ""
 echo "  Install: open the .dmg, drag flowcyto into Applications."
-echo "  First launch: right-click flowcyto → Open (unsigned/un-notarized app)."
+echo "  First launch (un-notarized): clear Gatekeeper once —"
+echo "    xattr -dr com.apple.quarantine /Applications/flowcyto.app"
+echo "  Recipient instructions: INSTALL.md (also bundled as 'Open Me First.txt')."
