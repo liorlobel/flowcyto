@@ -5,6 +5,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 
 use egui::{Color32, RichText, Stroke};
+use egui_extras::{Column, TableBuilder};
 use egui_plot::{
     GridMark, Legend, Line, Plot, PlotBounds, PlotPoint, PlotPoints, Points,
     Polygon as PlotPolygon, Text as PlotText,
@@ -993,7 +994,7 @@ impl FlowCytoApp {
 
 impl eframe::App for FlowCytoApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.set_visuals(if self.dark_mode { egui::Visuals::dark() } else { egui::Visuals::light() });
+        ctx.set_visuals(themed_visuals(self.dark_mode));
 
         if self.needs_reprocess {
             self.reprocess();
@@ -3036,27 +3037,42 @@ impl FlowCytoApp {
                     }
                 });
             });
-            egui::ScrollArea::both().show(ui, |ui| {
-                egui::Grid::new("batch_grid").striped(true).spacing([14.0, 4.0]).show(ui, |ui| {
-                    for h in &["Group", "Sample", "Population", "Count", "%Parent", "%Total"] {
-                        ui.label(RichText::new(*h).strong());
+            let num = |ui: &mut egui::Ui, s: String| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.monospace(s));
+            };
+            TableBuilder::new(ui)
+                .striped(true)
+                .resizable(true)
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(Column::auto().at_least(80.0))                 // Group
+                .column(Column::auto().at_least(120.0).clip(true))     // Sample
+                .column(Column::auto().at_least(140.0).clip(true))     // Population
+                .column(Column::auto().at_least(60.0))                 // Count
+                .column(Column::auto().at_least(64.0))                 // %Parent
+                .column(Column::auto().at_least(64.0))                 // %Total
+                .column(Column::remainder().at_least(80.0))            // MFI
+                .header(22.0, |mut h| {
+                    for t in ["Group", "Sample", "Population", "Count", "%Parent", "%Total"] {
+                        h.col(|ui| { ui.strong(t); });
                     }
-                    ui.label(RichText::new(format!("MFI {}", sel_name)).strong());
-                    ui.end_row();
-                    for (group, sample, name, depth, count, pp, pt, medians, ch_names) in &rows {
-                        ui.label(RichText::new(group).color(Color32::GRAY));
-                        ui.label(sample);
-                        ui.label(format!("{}{}", "  ".repeat(*depth), name));
-                        ui.label(count.to_string());
-                        ui.label(format!("{:.2}%", pp));
-                        ui.label(format!("{:.2}%", pt));
-                        let mfi = ch_names.iter().position(|c| c.eq_ignore_ascii_case(&sel_name))
-                            .and_then(|k| medians.get(k).copied()).unwrap_or(f64::NAN);
-                        ui.label(fmt(mfi));
-                        ui.end_row();
-                    }
+                    h.col(|ui| { ui.strong(format!("MFI {}", sel_name)); });
+                })
+                .body(|body| {
+                    body.rows(20.0, rows.len(), |mut row| {
+                        let (group, sample, name, depth, count, pp, pt, medians, ch_names) = &rows[row.index()];
+                        row.col(|ui| { ui.label(RichText::new(group).color(Color32::GRAY)); });
+                        row.col(|ui| { ui.label(sample); });
+                        row.col(|ui| { ui.label(format!("{}{}", "  ".repeat(*depth), name)); });
+                        row.col(|ui| { num(ui, count.to_string()); });
+                        row.col(|ui| { num(ui, format!("{:.2}%", pp)); });
+                        row.col(|ui| { num(ui, format!("{:.2}%", pt)); });
+                        row.col(|ui| {
+                            let mfi = ch_names.iter().position(|c| c.eq_ignore_ascii_case(&sel_name))
+                                .and_then(|k| medians.get(k).copied()).unwrap_or(f64::NAN);
+                            num(ui, fmt(mfi));
+                        });
+                    });
                 });
-            });
         }
 
         if !skipped.is_empty() {
@@ -3814,13 +3830,50 @@ fn nonlinear_grid(ct: &CompiledTransform, linear: bool, inp: egui_plot::GridInpu
 
 // ── Entry point ────────────────────────────────────────────────────────────
 
+/// One-time style setup: spacing, padding, rounded widgets, readable text sizes.
+/// (Spacing/text persist across the per-frame `set_visuals` calls.)
+fn setup_style(ctx: &egui::Context) {
+    use egui::{FontFamily::{Monospace, Proportional}, FontId, TextStyle};
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(8.0, 4.0);
+    style.spacing.interact_size.y = 24.0;
+    style.spacing.menu_margin = egui::Margin::same(6.0);
+    style.text_styles = [
+        (TextStyle::Heading, FontId::new(18.0, Proportional)),
+        (TextStyle::Body, FontId::new(14.0, Proportional)),
+        (TextStyle::Button, FontId::new(14.0, Proportional)),
+        (TextStyle::Monospace, FontId::new(13.0, Monospace)),
+        (TextStyle::Small, FontId::new(11.0, Proportional)),
+    ].into();
+    ctx.set_style(style);
+}
+
+/// Dark/light visuals with a teal accent (matching the app icon) and softer
+/// rounded widgets. Rebuilt each frame because `set_visuals` resets visuals.
+fn themed_visuals(dark: bool) -> egui::Visuals {
+    let mut v = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
+    let accent = Color32::from_rgb(38, 162, 156);
+    v.selection.bg_fill = accent.linear_multiply(if dark { 0.55 } else { 0.35 });
+    v.selection.stroke = Stroke::new(1.0, accent);
+    v.hyperlink_color = accent;
+    let r = egui::Rounding::same(5.0);
+    v.widgets.noninteractive.rounding = r;
+    v.widgets.inactive.rounding = r;
+    v.widgets.hovered.rounding = r;
+    v.widgets.active.rounding = r;
+    v.window_rounding = egui::Rounding::same(8.0);
+    v
+}
+
 pub fn run_gui(initial_file: Option<&Path>) {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1500.0_f32, 950.0_f32]).with_title("flowcyto"),
         ..Default::default()
     };
-    eframe::run_native("flowcyto", options, Box::new(|_cc| {
+    eframe::run_native("flowcyto", options, Box::new(|cc| {
+        setup_style(&cc.egui_ctx);
         let mut app = FlowCytoApp::default();
         if let Some(p) = initial_file { app.load_file(p); }
         Ok(Box::new(app))
