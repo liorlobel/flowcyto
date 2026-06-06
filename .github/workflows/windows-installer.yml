@@ -59,6 +59,6 @@ jobs:
           $exe = (Get-ChildItem packaging/windows/Output/*.exe | Select-Object -First 1).FullName
           gh release view $tag 2>$null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --title "flowcyto $tag" --notes "Automated Windows installer build."
+            gh release create $tag --title "flowcyto $tag" --generate-notes
           }
           gh release upload $tag "$exe" --clobber

@@ -1,0 +1,52 @@
+name: macOS installer
+
+# Builds the macOS .app/.dmg on an Apple-Silicon runner (with clippy + test
+# gates) and packages the drag-to-Applications disk image. Runs on version tags
+# (attaching the .dmg to that release) and on manual dispatch (artifact only).
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --release --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Build installer (.app + .dmg)
+        run: ./packaging/make-macos-app.sh
+
+      - name: Read version from Cargo.toml
+        id: ver
+        run: echo "version=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*\"([^\"]+)\".*/\1/')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload dmg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flowcyto-${{ steps.ver.outputs.version }}-macos-dmg
+          path: dist/*.dmg
+          if-no-files-found: error
+
+      - name: Attach dmg to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "flowcyto $tag" --generate-notes
+          gh release upload "$tag" dist/flowcyto-*.dmg --clobber
