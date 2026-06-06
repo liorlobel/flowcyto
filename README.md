@@ -40,7 +40,9 @@ Privacy & Security on macOS 15+). Full details: [INSTALL.md](INSTALL.md).
    restricts to that population so you can draw child gates on it (e.g. singlets →
    live → CD45⁺ → lineage). The **Viewing:** breadcrumb shows your path; click any
    level to jump back. Switch the left X/Y to gate on different channels, or use
-   the **2×2 grid** layout (top of the Plot tab) to see several gates at once.
+   the **Grid** layout (top of the Plot tab) — an adjustable **cols × rows** grid
+   from 1×1 up to **6×6** where each cell has its own X/Y and scale, so you can
+   see (and gate on) the whole gating sequence at once.
 
 5. **Read the numbers.** The **Stats** tab shows a per-population table
    (count, %parent, %total, median MFI per channel) with **💾 Export CSV (tidy)**.
