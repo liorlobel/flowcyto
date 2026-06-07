@@ -37,8 +37,11 @@ and click **Open Anyway**, then confirm. After that it launches normally.
 
 Notarization (the thing that removes the warning entirely) requires a paid Apple
 Developer Program membership. The app is otherwise a normal, self-contained
-native binary — no installer daemon, no network calls, nothing runs in the
-background. Removing quarantine simply tells Gatekeeper you trust this app.
+native binary — no installer daemon, nothing runs in the background. The only
+network access is the optional **Check for Updates** action (toolbar button or
+the macOS menu), which runs *only* when you click it — never on launch — and
+just compares your version against the GitHub Releases page. Removing quarantine
+simply tells Gatekeeper you trust this app.
 
 ## Uninstall
 

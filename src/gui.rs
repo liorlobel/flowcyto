@@ -287,6 +287,10 @@ pub struct FlowCytoApp {
     batch_rx: Option<Receiver<BatchMsg>>,        // streamed results from the worker thread
     batch_cancel: Option<Arc<AtomicBool>>,       // set to stop the worker early
     batch_progress: Option<(usize, usize)>,      // (done, total) while a batch runs
+    // Manual update check (the app's only network path; fires only on explicit click).
+    update_rx: Option<Receiver<Result<crate::update::UpdateInfo, String>>>,
+    update_msg: Option<String>,                  // last update-check result message
+    update_found: Option<crate::update::UpdateInfo>, // Some when a newer release exists
     ref_sample: Option<usize>,       // reference sample overlaid behind the active scatter
     ref_scatter: Option<RefScatter>,
 
@@ -377,6 +381,7 @@ impl Default for FlowCytoApp {
             samples: Vec::new(), active_sample: 0, batch: None, batch_channel: 0,
             batch_plot_pop: None, batch_plot_metric: BatchMetric::PctParent,
             batch_rx: None, batch_cancel: None, batch_progress: None,
+            update_rx: None, update_msg: None, update_found: None,
             ref_sample: None, ref_scatter: None,
             do_compensate: false, dark_mode: true,
             colormap: ColorMap::Viridis,
@@ -1186,6 +1191,7 @@ impl eframe::App for FlowCytoApp {
         self.handle_menu_events(ctx);
         self.handle_dropped_files(ctx);
         self.poll_batch(ctx);
+        self.poll_updates(ctx);
         self.handle_keys(ctx);
 
         self.panel_top(ctx);
@@ -1281,7 +1287,7 @@ impl FlowCytoApp {
     /// so the menu never diverges from the in-app controls.
     #[cfg(target_os = "macos")]
     fn handle_menu_events(&mut self, ctx: &egui::Context) {
-        enum A { Open, SaveGates, SaveSession, LoadSession, SavePlot, Undo, Redo, Theme, Tab(usize), ZoomIn, ZoomOut, ZoomReset }
+        enum A { Open, SaveGates, SaveSession, LoadSession, SavePlot, CheckUpdates, Undo, Redo, Theme, Tab(usize), ZoomIn, ZoomOut, ZoomReset }
         let mut acts: Vec<A> = Vec::new();
         if let Some(st) = &self.menu {
             while let Ok(ev) = muda::MenuEvent::receiver().try_recv() {
@@ -1291,6 +1297,7 @@ impl FlowCytoApp {
                 else if id == st.save_session { acts.push(A::SaveSession); }
                 else if id == st.load_session { acts.push(A::LoadSession); }
                 else if id == st.save_plot { acts.push(A::SavePlot); }
+                else if id == st.check_updates { acts.push(A::CheckUpdates); }
                 else if id == st.undo { acts.push(A::Undo); }
                 else if id == st.redo { acts.push(A::Redo); }
                 else if id == st.theme { acts.push(A::Theme); }
@@ -1311,6 +1318,7 @@ impl FlowCytoApp {
                 A::SaveSession => self.save_session(),
                 A::LoadSession => self.load_session(),
                 A::SavePlot => self.request_plot_png(),
+                A::CheckUpdates => self.start_update_check(),
                 A::Undo => self.undo(),
                 A::Redo => self.redo(),
                 A::Theme => { self.dark_mode = !self.dark_mode; self.needs_rescatter = true; }
@@ -1374,8 +1382,78 @@ impl FlowCytoApp {
                 ui.selectable_value(&mut self.active_tab, ActiveTab::Stats, "Stats");
                 ui.selectable_value(&mut self.active_tab, ActiveTab::Batch, "Batch");
                 ui.selectable_value(&mut self.active_tab, ActiveTab::Spillover, "Spillover");
+
+                // Right-aligned: manual update check (the app's only network call).
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.ui_update_check(ui);
+                });
             });
         });
+    }
+
+    /// Toolbar "Check for Updates" control. Rendered inside a right-to-left layout, so
+    /// the first widget added is the right-most. Network happens only on click.
+    fn ui_update_check(&mut self, ui: &mut egui::Ui) {
+        if self.update_rx.is_some() {
+            ui.add(egui::Spinner::new());
+            ui.label(RichText::new("checking…").weak());
+            return;
+        }
+        if ui.button("⟳ Updates")
+            .on_hover_text("Check GitHub for a newer version — the app's only network call, made only when you click this")
+            .clicked()
+        {
+            self.start_update_check();
+        }
+        if let Some(info) = self.update_found.clone() {
+            if ui.button(RichText::new(format!("⬇ Download v{}", info.latest))
+                    .strong().color(Color32::from_rgb(90, 200, 90)))
+                .on_hover_text(format!("Open {}", info.url))
+                .clicked()
+            {
+                let _ = open::that(&info.url);
+            }
+        } else if let Some(msg) = &self.update_msg {
+            ui.label(RichText::new(msg).weak());
+        }
+    }
+
+    /// Spawn the (blocking) GitHub Releases check on a background thread.
+    fn start_update_check(&mut self) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || { let _ = tx.send(crate::update::check_latest()); });
+        self.update_rx = Some(rx);
+        self.update_msg = Some("Checking for updates…".into());
+        self.update_found = None;
+    }
+
+    /// Drain the update-check result (called each frame while a check is in flight).
+    fn poll_updates(&mut self, ctx: &egui::Context) {
+        let done = match &self.update_rx {
+            Some(rx) => match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Empty) => { ctx.request_repaint(); None }
+                Err(TryRecvError::Disconnected) => Some(Err("update check stopped unexpectedly".to_string())),
+            },
+            None => return,
+        };
+        if let Some(result) = done {
+            self.update_rx = None;
+            match result {
+                Ok(info) => {
+                    self.update_msg = Some(if info.newer {
+                        format!("v{} available (you have {})", info.latest, info.current)
+                    } else {
+                        format!("Up to date (v{})", info.current)
+                    });
+                    self.update_found = if info.newer { Some(info) } else { None };
+                }
+                Err(e) => {
+                    self.update_msg = Some(format!("Update check failed: {e}"));
+                    self.update_found = None;
+                }
+            }
+        }
     }
 
     fn panel_left(&mut self, ctx: &egui::Context) {
@@ -4462,6 +4540,7 @@ struct MenuState {
     save_session: muda::MenuId,
     load_session: muda::MenuId,
     save_plot: muda::MenuId,
+    check_updates: muda::MenuId,
     undo: muda::MenuId,
     redo: muda::MenuId,
     theme: muda::MenuId,
@@ -4485,8 +4564,9 @@ fn build_menu() -> MenuState {
         version: Some(env!("CARGO_PKG_VERSION").to_string()),
         ..Default::default()
     }));
+    let check_updates = MenuItem::new("Check for Updates…", true, None);
     let _ = app_m.append_items(&[
-        &about, &PredefinedMenuItem::separator(),
+        &about, &check_updates, &PredefinedMenuItem::separator(),
         &PredefinedMenuItem::hide(None), &PredefinedMenuItem::quit(None),
     ]);
 
@@ -4534,6 +4614,7 @@ fn build_menu() -> MenuState {
         save_session: save_session.id().clone(),
         load_session: load_session.id().clone(),
         save_plot: save_plot.id().clone(),
+        check_updates: check_updates.id().clone(),
         undo: undo.id().clone(),
         redo: redo.id().clone(),
         theme: theme.id().clone(),

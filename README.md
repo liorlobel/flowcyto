@@ -77,6 +77,10 @@ compensation — to reopen later.
 - **Keyboard:** `R`/`E`/`P`/`Q` draw tools, `G` edit, `V`/`Esc` navigate,
   `Ctrl/Cmd+Z` undo, `1`–`5` switch tabs.
 - **📷 Save plot…** exports the current plot as a PNG.
+- **Check for updates:** the toolbar's **⟳ Updates** button (or **flowcyto →
+  Check for Updates…** on macOS) compares your version against the latest GitHub
+  release and opens the download page if there's a newer one. It's the app's only
+  network access and runs *only* when you click it — never on launch.
 
 ## Command line
 
@@ -88,6 +92,7 @@ flowcyto stats   sample.fcs --compensate            # per-channel summary
 flowcyto popstats sample.fcs -g gates.json -o csv   # per-population stats → tidy CSV
 flowcyto gate    sample.fcs -g gates.json           # gate counts
 flowcyto gui     sample.fcs                          # open in the GUI
+flowcyto update                                      # check GitHub for a newer release
 ```
 
 ## Building from source

@@ -13,8 +13,8 @@ cd /Users/liorlobel/flowcyto && /opt/homebrew/bin/rustup run stable cargo build 
 - GUI: `flowcyto gui <file.fcs>`  (or `flowcyto` with no args → GUI)
 - **macOS installer:** `./packaging/make-macos-app.sh` → `dist/flowcyto.app` + `dist/flowcyto-<version>.dmg` (drag-to-Applications). Builds host-arch (Apple Silicon), generates the `.icns` from `packaging/icon.png` (itself regenerable via `python3 packaging/make-icon.py` — a procedural viridis density-plot + gate-ring mark), writes Info.plist with the Cargo version, ad-hoc code-signs, and bundles an "Open Me First.txt" Gatekeeper guide into the DMG. Not notarized (needs paid Apple Developer Program) → recipients clear Gatekeeper once via `xattr -dr com.apple.quarantine /Applications/flowcyto.app` or "Open Anyway"; see `INSTALL.md`. `dist/` is git-ignored.
 - **Releasing:** bump `version` in `Cargo.toml`, commit, then push a `vX.Y.Z` tag. Two GitHub Actions workflows (`.github/workflows/macos-installer.yml`, `windows-installer.yml`) build on `macos-latest` (clippy+test gate → `.dmg`) and `windows-latest` (test → Inno Setup `.exe`) and attach both installers to the release (auto-created with `--generate-notes`; edit notes after if desired). Both also run on manual dispatch (artifact only). No need to build installers locally anymore.
-- Always finish with: `cargo build --release` clean, `cargo clippy --release --all-targets` = **0 warnings**, `cargo test --release` = **106 tests pass** (102 unit + 4 CLI integration). Unit tests live inline (`#[cfg(test)] mod tests`) in each module; `src/test_util.rs` is a `cfg(test)`-only in-memory `FcsFile` builder; `tests/cli.rs` drives the real binary against `tests/fixtures/tiny.fcs`. Add a regression test alongside any numeric change.
-- Current released version: **0.1.6** (latest GitHub release; macOS `.dmg` + Windows `.exe`, unsigned).
+- Always finish with: `cargo build --release` clean, `cargo clippy --release --all-targets` = **0 warnings**, `cargo test --release` = **109 tests pass** (105 unit + 4 CLI integration). Unit tests live inline (`#[cfg(test)] mod tests`) in each module; `src/test_util.rs` is a `cfg(test)`-only in-memory `FcsFile` builder; `tests/cli.rs` drives the real binary against `tests/fixtures/tiny.fcs`. Add a regression test alongside any numeric change.
+- Current released version: **0.1.8** (latest GitHub release; macOS `.dmg` + Windows `.exe`, unsigned).
 
 ## Architecture (src/)
 | file | role |
@@ -28,9 +28,10 @@ cd /Users/liorlobel/flowcyto && /opt/homebrew/bin/rustup run stable cargo build 
 | `popstats.rs` | **pure** per-population stats engine (count/%parent/%total/median-MFI/mean/CV) — also the batch engine |
 | `stats.rs` | per-channel whole-file stats (CLI `stats`) |
 | `gui.rs` | egui GUI (~4.5k LOC) — tabs Plot/Histogram/Stats/Batch/Spillover; native macOS menu bar via `muda` (cfg-gated) |
+| `update.rs` | manual "check for updates" vs the GitHub Releases API (version compare; the app's **only** network call, fired only on explicit user action) |
 | `main.rs` | clap CLI |
 
-**CLI:** `info stats export gate popstats spillover compute-spillover rewrite-spillover transform-dump gui`
+**CLI:** `info update stats export gate popstats spillover compute-spillover rewrite-spillover transform-dump gui`
 
 **GUI:** left panel = Samples (QC counts, 👁 overlay, **group/condition tags**) · Channels (X/Y + per-axis scale, "apply X scale to all fluorescence") · Axis limits · Gates. Toolbar: Open/**Recent**/**Save+Load session**/Compensate/theme/tabs. Gating: draw ▭⬭⬠ ✛Quad ✎Edit (drag body to move, rotate ellipse), **double-click a gate to drill in**, per-gate **👁 hide** + **⊕ zoom-to-gate**, **➕ Boolean (AND/OR/NOT)** builder, **undo/redo**, numeric inspector, save/load JSON, **export a population → .fcs**. Tabs: Plot (density dots or **filled heatmap "Fill"**, contours, gates, control overlay, backgate, **🔒 Lock view** = frozen pan/zoom, **adjustable Single / cols×rows grid up to 6×6**, Viridis/Jet colormap, **📷 Save plot PNG**, inline ⚖ compensation preview), Histogram (overlays + interval gates), Stats (table + CSV + **📋 Copy TSV**), Batch (threaded multi-sample → CSV + **📋 Copy** + **📊 chart across samples**), Spillover (view/edit/compute/write matrix). **Drag-and-drop .fcs** to open; keyboard shortcuts (R/E/P/Q/G/V/Esc, ⌘Z/⌘S/⌘1–5) + ⌘+/− UI zoom.
 

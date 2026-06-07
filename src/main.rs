@@ -17,6 +17,7 @@ mod stats;
 #[cfg(test)]
 mod test_util;
 mod transform;
+mod update;
 
 use std::path::{Path, PathBuf};
 
@@ -57,6 +58,9 @@ enum Command {
     Info {
         file: PathBuf,
     },
+
+    /// Check GitHub for a newer release (the only command that touches the network).
+    Update,
 
     /// Print per-channel summary statistics.
     Stats {
@@ -212,6 +216,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Info { file } => cmd_info(&file),
+        Command::Update => cmd_update(),
         Command::Stats { file, compensate, transform, cofactor } =>
             cmd_stats(&file, compensate, &transform, cofactor),
         Command::Export { file, output, compensate, transform, cofactor } =>
@@ -274,6 +279,18 @@ fn cmd_transform_dump(
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────
+
+fn cmd_update() -> Result<()> {
+    match update::check_latest() {
+        Ok(info) if info.newer => {
+            println!("A newer version is available: v{} (you have v{})", info.latest, info.current);
+            println!("Download: {}", info.url);
+        }
+        Ok(info) => println!("You're on the latest version (v{}).", info.current),
+        Err(e) => anyhow::bail!("update check failed: {}", e),
+    }
+    Ok(())
+}
 
 fn cmd_info(path: &Path) -> Result<()> {
     let fcs = FcsFile::open(path)?;
