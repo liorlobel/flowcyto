@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use egui::{Color32, RichText, Stroke};
 use egui_extras::{Column, TableBuilder};
+use egui_phosphor::regular as icon;
 use egui_plot::{
     GridMark, Legend, Line, Plot, PlotBounds, PlotImage, PlotPoint, PlotPoints, Points,
     Polygon as PlotPolygon, Text as PlotText,
@@ -45,14 +46,23 @@ fn fmt_count(n: usize) -> String {
 
 // ── Colors ────────────────────────────────────────────────────────────────
 
-/// Density-scatter colormap. Jet is the legacy rainbow; Viridis is the
-/// perceptually-uniform, colorblind-safe default preferred for publication.
+/// Density-scatter colormap. Viridis/Magma/Cividis/Turbo are perceptually-uniform,
+/// colorblind-safe maps (Viridis is the publication default); Jet is the legacy
+/// rainbow, kept for familiarity but perceptually misleading.
 #[derive(Clone, Copy, PartialEq)]
-enum ColorMap { Viridis, Jet }
+enum ColorMap { Viridis, Magma, Turbo, Cividis, Jet }
 
 impl ColorMap {
+    const ALL: [ColorMap; 5] =
+        [ColorMap::Viridis, ColorMap::Magma, ColorMap::Turbo, ColorMap::Cividis, ColorMap::Jet];
     fn label(self) -> &'static str {
-        match self { ColorMap::Viridis => "Viridis", ColorMap::Jet => "Jet" }
+        match self {
+            ColorMap::Viridis => "Viridis", ColorMap::Magma => "Magma", ColorMap::Turbo => "Turbo",
+            ColorMap::Cividis => "Cividis", ColorMap::Jet => "Jet",
+        }
+    }
+    fn from_name(s: &str) -> Option<Self> {
+        ColorMap::ALL.into_iter().find(|c| c.label() == s)
     }
 }
 
@@ -63,10 +73,50 @@ fn density_color(bucket: usize, n: usize, dark: bool, cmap: ColorMap) -> Color32
 
 /// Colormap lookup for a continuous density value t ∈ [0,1] (used by the filled heatmap).
 fn density_color_t(t: f32, dark: bool, cmap: ColorMap) -> Color32 {
-    match cmap {
-        ColorMap::Jet => jet_color(t, dark),
-        ColorMap::Viridis => viridis_color(t),
-    }
+    let (r, g, b) = match cmap {
+        ColorMap::Jet => return jet_color(t, dark),
+        ColorMap::Viridis => lerp_anchors(t, &VIRIDIS),
+        ColorMap::Magma => lerp_anchors(t, &MAGMA),
+        ColorMap::Cividis => lerp_anchors(t, &CIVIDIS),
+        ColorMap::Turbo => turbo(t),
+    };
+    Color32::from_rgba_unmultiplied(r, g, b, 220)
+}
+
+/// Piecewise-linear interpolation across an anchor table.
+fn lerp_anchors(t: f32, a: &[(u8, u8, u8)]) -> (u8, u8, u8) {
+    let n = a.len();
+    let x = t.clamp(0.0, 1.0) * (n - 1) as f32;
+    let i = (x.floor() as usize).min(n - 2);
+    let f = x - i as f32;
+    let m = |p: u8, q: u8| (p as f32 + (q as f32 - p as f32) * f) as u8;
+    (m(a[i].0, a[i + 1].0), m(a[i].1, a[i + 1].1), m(a[i].2, a[i + 1].2))
+}
+
+// 9-anchor samples of the matplotlib maps — smooth enough for density shading.
+const VIRIDIS: [(u8, u8, u8); 9] = [
+    (68, 1, 84), (72, 40, 120), (62, 74, 137), (49, 104, 142), (38, 130, 142),
+    (31, 158, 137), (53, 183, 121), (109, 205, 89), (253, 231, 37),
+];
+const MAGMA: [(u8, u8, u8); 9] = [
+    (0, 0, 4), (28, 16, 68), (79, 18, 123), (129, 37, 129), (181, 54, 122),
+    (229, 80, 100), (251, 135, 97), (254, 194, 135), (252, 253, 191),
+];
+const CIVIDIS: [(u8, u8, u8); 9] = [
+    (0, 32, 76), (0, 42, 102), (47, 64, 103), (81, 86, 106), (110, 109, 109),
+    (143, 133, 103), (180, 159, 89), (221, 186, 69), (255, 234, 70),
+];
+
+/// Turbo via the standard degree-5 polynomial approximation (Mikhailov/Google).
+/// Evaluated in f64 so the published coefficients keep full precision.
+fn turbo(t: f32) -> (u8, u8, u8) {
+    let t = t.clamp(0.0, 1.0) as f64;
+    let (t2, t3, t4, t5) = (t * t, t * t * t, t * t * t * t, t * t * t * t * t);
+    let r = 0.13572138 + 4.61539260 * t - 42.66032258 * t2 + 132.13108234 * t3 - 152.94239396 * t4 + 59.28637943 * t5;
+    let g = 0.09140261 + 2.19418839 * t + 4.84296658 * t2 - 14.18503333 * t3 + 4.27729857 * t4 + 2.82956604 * t5;
+    let b = 0.10667330 + 12.64194608 * t - 60.58204836 * t2 + 110.36276771 * t3 - 89.90310912 * t4 + 27.34824973 * t5;
+    let u = |x: f64| (x.clamp(0.0, 1.0) * 255.0) as u8;
+    (u(r), u(g), u(b))
 }
 
 fn jet_color(t: f32, dark: bool) -> Color32 {
@@ -86,29 +136,6 @@ fn jet_color(t: f32, dark: bool) -> Color32 {
         ((floor + r * scale) * 255.0) as u8,
         ((floor + g * scale) * 255.0) as u8,
         ((floor + b * scale) * 255.0) as u8,
-        220,
-    )
-}
-
-/// Viridis via piecewise-linear interpolation over 5 reference anchors.
-/// Reads well on both light and dark backgrounds (no floor lift needed).
-fn viridis_color(t: f32) -> Color32 {
-    const A: [(f32, f32, f32); 5] = [
-        (68.0, 1.0, 84.0),     // 0.00  deep purple
-        (59.0, 82.0, 139.0),   // 0.25  blue
-        (33.0, 144.0, 140.0),  // 0.50  teal
-        (93.0, 201.0, 99.0),   // 0.75  green
-        (253.0, 231.0, 37.0),  // 1.00  yellow
-    ];
-    let t = t.clamp(0.0, 1.0) * 4.0;
-    let i = (t.floor() as usize).min(3);
-    let f = t - i as f32;
-    let (r0, g0, b0) = A[i];
-    let (r1, g1, b1) = A[i + 1];
-    Color32::from_rgba_unmultiplied(
-        (r0 + (r1 - r0) * f) as u8,
-        (g0 + (g1 - g0) * f) as u8,
-        (b0 + (b1 - b0) * f) as u8,
         220,
     )
 }
@@ -204,7 +231,9 @@ struct Session {
     #[serde(default)]
     dark_mode: bool,
     #[serde(default)]
-    viridis: bool,
+    viridis: bool, // legacy (pre-0.1.9); superseded by `colormap`
+    #[serde(default)]
+    colormap: Option<String>,
     channel_tf: Vec<AxisTransform>,
     x_ch: usize,
     y_ch: usize,
@@ -511,8 +540,8 @@ impl FlowCytoApp {
             // Warn if gates reference channels this sample lacks.
             let missing = missing_gate_channels(&self.gates, &fcs);
             if !missing.is_empty() {
-                self.status = format!("⚠ {} missing channel(s): {} — gates may not apply",
-                    self.samples[i].name, missing.join(", "));
+                self.status = format!("{} {} missing channel(s): {} — gates may not apply",
+                    icon::WARNING, self.samples[i].name, missing.join(", "));
             } else {
                 self.status = format!("Active: {} ({} events)", self.samples[i].name, fcs.n_events);
             }
@@ -544,7 +573,7 @@ impl FlowCytoApp {
         match self.compensate_events(fcs) {
             Ok(ev) => self.compensated = ev,
             Err(e) => {
-                self.status = format!("⚠ Compensation failed — showing RAW data: {}", e);
+                self.status = format!("{} Compensation failed — showing RAW data: {}", icon::WARNING, e);
                 self.compensated = fcs.events.clone();
             }
         }
@@ -1333,7 +1362,7 @@ impl FlowCytoApp {
     fn panel_top(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("📂  Open FCS").clicked() {
+                if ui.button(format!("{}  Open FCS", icon::FILE_PLUS)).clicked() {
                     if let Some(paths) = rfd::FileDialog::new()
                         .add_filter("FCS files", &["fcs", "FCS"]).pick_files()
                     {
@@ -1345,7 +1374,7 @@ impl FlowCytoApp {
                     let recent = self.recent_files.clone();
                     let mut pick: Option<PathBuf> = None;
                     let mut clear = false;
-                    ui.menu_button("🕘 Recent", |ui| {
+                    ui.menu_button(format!("{} Recent", icon::CLOCK_COUNTER_CLOCKWISE), |ui| {
                         if recent.is_empty() { ui.label(RichText::new("(none)").weak()); }
                         for p in &recent {
                             let name = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
@@ -1361,27 +1390,27 @@ impl FlowCytoApp {
                     if clear { self.recent_files.clear(); self.save_recent(); }
                     if let Some(p) = pick { self.add_files(vec![p]); }
                 }
-                if ui.button("🖫 Save session").on_hover_text("Save workspace + gates + transforms + compensation").clicked() {
+                if ui.button(format!("{} Save session", icon::FLOPPY_DISK)).on_hover_text("Save workspace + gates + transforms + compensation").clicked() {
                     self.save_session();
                 }
-                if ui.button("📜 Load session").clicked() { self.load_session(); }
+                if ui.button(format!("{} Load session", icon::FOLDER_OPEN)).clicked() { self.load_session(); }
                 ui.separator();
                 if ui.checkbox(&mut self.do_compensate, "Compensate").changed() {
                     self.needs_reprocess = true;
                 }
                 ui.separator();
                 // Theme toggle
-                let theme_label = if self.dark_mode { "☀ Light" } else { "🌙 Dark" };
+                let theme_label = if self.dark_mode { format!("{} Light", icon::SUN) } else { format!("{} Dark", icon::MOON) };
                 if ui.button(theme_label).clicked() {
                     self.dark_mode = !self.dark_mode;
                     self.needs_rescatter = true; // recolor density floor
                 }
                 ui.separator();
-                ui.selectable_value(&mut self.active_tab, ActiveTab::Plot, "Plot");
-                ui.selectable_value(&mut self.active_tab, ActiveTab::Histogram, "Histogram");
-                ui.selectable_value(&mut self.active_tab, ActiveTab::Stats, "Stats");
-                ui.selectable_value(&mut self.active_tab, ActiveTab::Batch, "Batch");
-                ui.selectable_value(&mut self.active_tab, ActiveTab::Spillover, "Spillover");
+                ui.selectable_value(&mut self.active_tab, ActiveTab::Plot, format!("{} Plot", icon::CHART_SCATTER));
+                ui.selectable_value(&mut self.active_tab, ActiveTab::Histogram, format!("{} Histogram", icon::CHART_BAR));
+                ui.selectable_value(&mut self.active_tab, ActiveTab::Stats, format!("{} Stats", icon::TABLE));
+                ui.selectable_value(&mut self.active_tab, ActiveTab::Batch, format!("{} Batch", icon::STACK));
+                ui.selectable_value(&mut self.active_tab, ActiveTab::Spillover, format!("{} Spillover", icon::GRID_NINE));
 
                 // Right-aligned: manual update check (the app's only network call).
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1399,14 +1428,14 @@ impl FlowCytoApp {
             ui.label(RichText::new("checking…").weak());
             return;
         }
-        if ui.button("⟳ Updates")
+        if ui.button(format!("{} Updates", icon::ARROWS_CLOCKWISE))
             .on_hover_text("Check GitHub for a newer version — the app's only network call, made only when you click this")
             .clicked()
         {
             self.start_update_check();
         }
         if let Some(info) = self.update_found.clone() {
-            if ui.button(RichText::new(format!("⬇ Download v{}", info.latest))
+            if ui.button(RichText::new(format!("{} Download v{}", icon::DOWNLOAD_SIMPLE, info.latest))
                     .strong().color(Color32::from_rgb(90, 200, 90)))
                 .on_hover_text(format!("Open {}", info.url))
                 .clicked()
@@ -1538,7 +1567,7 @@ impl FlowCytoApp {
         }
         ui.label(format!("{} events · {} ch", n_events, n));
         if has_spill {
-            ui.label(RichText::new("$SPILLOVER ✓").small().color(Color32::from_rgb(80, 180, 80)));
+            ui.label(RichText::new(format!("$SPILLOVER {}", icon::CHECK)).small().color(Color32::from_rgb(80, 180, 80)));
         }
 
         if ch_changed || tf_changed { self.needs_rescatter = true; }
@@ -1647,11 +1676,11 @@ impl FlowCytoApp {
 
         // Draw-mode buttons
         ui.horizontal(|ui| {
-            self.draw_btn(ui, DrawMode::Rect, "▭ Rect");
-            self.draw_btn(ui, DrawMode::Ellipse, "⬭ Ellipse");
-            self.draw_btn(ui, DrawMode::Polygon, "⬠ Polygon");
-            self.draw_btn(ui, DrawMode::Quadrant, "✛ Quad");
-            self.draw_btn(ui, DrawMode::Edit, "✎ Edit");
+            self.draw_btn(ui, DrawMode::Rect, &format!("{} Rect", icon::RECTANGLE));
+            self.draw_btn(ui, DrawMode::Ellipse, &format!("{} Ellipse", icon::CIRCLE));
+            self.draw_btn(ui, DrawMode::Polygon, &format!("{} Polygon", icon::POLYGON));
+            self.draw_btn(ui, DrawMode::Quadrant, &format!("{} Quad", icon::CROSSHAIR_SIMPLE));
+            self.draw_btn(ui, DrawMode::Edit, &format!("{} Edit", icon::PENCIL_SIMPLE));
         });
         ui.label(RichText::new("keys: R/E/P/Q draw · G edit · V/Esc nav · ⌘Z undo")
             .small().color(Color32::GRAY))
@@ -1664,7 +1693,7 @@ impl FlowCytoApp {
                     DrawMode::Edit => "select a gate (■): drag handles to resize, body to move, outer handle to rotate",
                     _ => "drag on plot",
                 };
-                ui.label(RichText::new(format!("✏ {}", hint)).color(Color32::from_rgb(220, 170, 0)).small());
+                ui.label(RichText::new(format!("{} {}", icon::PENCIL_SIMPLE, hint)).color(Color32::from_rgb(220, 170, 0)).small());
                 if self.draw_mode == DrawMode::Polygon && self.poly_vertices.len() >= 3
                     && ui.small_button("Finish").clicked()
                 {
@@ -1710,7 +1739,7 @@ impl FlowCytoApp {
         if !self.gates.is_empty() {
             let gate_list: Vec<(u32, String)> = self.gates.iter().map(|g| (g.id, g.name.clone())).collect();
             let mut create_bool = false;
-            egui::CollapsingHeader::new("➕ Boolean gate").id_salt("bool_builder").show(ui, |ui| {
+            egui::CollapsingHeader::new(format!("{} Boolean gate", icon::PLUS)).id_salt("bool_builder").show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Op:");
                     ui.selectable_value(&mut self.bool_op, BoolOp::And, "AND");
@@ -1769,13 +1798,13 @@ impl FlowCytoApp {
                     self.active_pop = Some(gid); self.new_gate_parent = Some(gid); self.scatter = None;
                 }
                 let hidden = self.scatter_hidden.contains(&gid);
-                if ui.small_button(if hidden { "🚫" } else { "👁" })
+                if ui.small_button(if hidden { icon::EYE_SLASH } else { icon::EYE })
                     .on_hover_text("show / hide this gate's outline on the plot").clicked()
                 {
                     if hidden { self.scatter_hidden.remove(&gid); } else { self.scatter_hidden.insert(gid); }
                 }
-                if ui.small_button("⊕").on_hover_text("zoom the plot to this gate").clicked() { zoom_to = Some(gid); }
-                if ui.small_button("🗑").clicked() { to_delete = Some(gid); }
+                if ui.small_button(icon::MAGNIFYING_GLASS_PLUS).on_hover_text("zoom the plot to this gate").clicked() { zoom_to = Some(gid); }
+                if ui.small_button(icon::TRASH).clicked() { to_delete = Some(gid); }
             });
             ui.horizontal(|ui| {
                 ui.add_space(depth as f32 * 14.0 + 16.0);
@@ -2026,6 +2055,7 @@ impl FlowCytoApp {
             do_compensate: self.do_compensate,
             dark_mode: self.dark_mode,
             viridis: self.colormap == ColorMap::Viridis,
+            colormap: Some(self.colormap.label().to_string()),
             channel_tf: self.channel_tf.clone(),
             x_ch: self.x_ch,
             y_ch: self.y_ch,
@@ -2083,7 +2113,8 @@ impl FlowCytoApp {
         for (s, (_, g)) in self.samples.iter_mut().zip(surviving.iter()) { s.group = g.clone(); }
         self.do_compensate = session.do_compensate;
         self.dark_mode = session.dark_mode;
-        self.colormap = if session.viridis { ColorMap::Viridis } else { ColorMap::Jet };
+        self.colormap = session.colormap.as_deref().and_then(ColorMap::from_name)
+            .unwrap_or(if session.viridis { ColorMap::Viridis } else { ColorMap::Jet });
         self.spill_override = session.spill_override;
         // Validate a session-supplied override is square before any panel indexes it
         // (every other override entry point validates; a hand-edited session might not).
@@ -2118,7 +2149,7 @@ impl FlowCytoApp {
         self.status = if missing == 0 {
             format!("Loaded session ({} samples) from {}", self.samples.len(), path.display())
         } else {
-            format!("Loaded session — ⚠ {} file(s) missing and skipped", missing)
+            format!("Loaded session — {} {} file(s) missing and skipped", icon::WARNING, missing)
         };
     }
 
@@ -2497,7 +2528,7 @@ impl FlowCytoApp {
     fn ui_comp_preview(&mut self, ui: &mut egui::Ui, x_name: &str, y_name: &str) {
         let xb = x_name_base(x_name);
         let yb = x_name_base(y_name);
-        egui::CollapsingHeader::new("⚖ Compensation (current X↔Y)").id_salt("comp_preview").show(ui, |ui| {
+        egui::CollapsingHeader::new(format!("{} Compensation (current X↔Y)", icon::SCALES)).id_salt("comp_preview").show(ui, |ui| {
             let mat = self.active_matrix();
             let channels = match &mat { Some((c, _)) => c.clone(), None => {
                 ui.label(RichText::new("No spillover matrix for this file — create one on the Spillover tab.")
@@ -2540,7 +2571,7 @@ impl FlowCytoApp {
             if self.spill_override.is_some() {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("● override active").small().color(Color32::from_rgb(230, 140, 40)));
-                    if ui.small_button("↺ reset to embedded").clicked() {
+                    if ui.small_button(format!("{} reset to embedded", icon::ARROW_COUNTER_CLOCKWISE)).clicked() {
                         self.spill_override = None; self.needs_reprocess = true;
                     }
                 });
@@ -2550,11 +2581,31 @@ impl FlowCytoApp {
 
     // ── Scatter plot ──────────────────────────────────────────────────
 
+    /// Centered empty-state shown in the plot area before any file is loaded.
+    fn empty_state(&mut self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
+            ui.add_space((ui.available_height() * 0.30).max(20.0));
+            ui.label(RichText::new(icon::CHART_SCATTER).size(58.0).color(Color32::from_rgb(38, 162, 156)));
+            ui.add_space(10.0);
+            ui.label(RichText::new("No data loaded").heading());
+            ui.add_space(2.0);
+            ui.label(RichText::new("Open an FCS file to plot and gate your samples.").color(Color32::GRAY));
+            ui.add_space(16.0);
+            if ui.button(RichText::new(format!("{}  Open FCS…", icon::FILE_PLUS)).size(15.0)).clicked() {
+                if let Some(paths) = rfd::FileDialog::new()
+                    .add_filter("FCS files", &["fcs", "FCS"]).pick_files()
+                {
+                    self.add_files(paths);
+                }
+            }
+            ui.add_space(6.0);
+            ui.label(RichText::new("…or drag a .fcs file onto the window").small().weak());
+        });
+    }
+
     fn scatter_plot(&mut self, ui: &mut egui::Ui) {
         if self.fcs.is_none() {
-            ui.centered_and_justified(|ui| {
-                ui.label(RichText::new("Open an FCS file to display the scatter plot.").color(Color32::GRAY));
-            });
+            self.empty_state(ui);
             return;
         }
 
@@ -2581,7 +2632,7 @@ impl FlowCytoApp {
                     .on_hover_text("Filled density heatmap instead of dots");
                 ui.separator();
             }
-            ui.checkbox(&mut self.lock_view, "🔒 Lock view")
+            ui.checkbox(&mut self.lock_view, format!("{} Lock view", icon::LOCK_SIMPLE))
                 .on_hover_text("Freeze pan/zoom so the plot holds still while gating (uncheck to drag-pan / pinch-zoom)");
             if !self.grid_mode && !self.lock_view
                 && ui.button("⤢ Fit").on_hover_text("Reset zoom to fit all data").clicked()
@@ -2591,13 +2642,14 @@ impl FlowCytoApp {
             ui.separator();
             ui.label("Colormap:");
             egui::ComboBox::from_id_salt("cmap").selected_text(self.colormap.label()).show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.colormap, ColorMap::Viridis, "Viridis");
-                ui.selectable_value(&mut self.colormap, ColorMap::Jet, "Jet");
+                for cm in ColorMap::ALL {
+                    ui.selectable_value(&mut self.colormap, cm, cm.label());
+                }
             });
             // PNG export captures one plot; not meaningful for the grid overview.
             if !self.grid_mode {
                 ui.separator();
-                if ui.button("📷 Save plot…").clicked() { self.request_plot_png(); }
+                if ui.button(format!("{} Save plot…", icon::CAMERA)).clicked() { self.request_plot_png(); }
             }
         });
 
@@ -3057,7 +3109,7 @@ impl FlowCytoApp {
             ui.separator();
             let drawing = self.hist_draw_interval;
             let lbl = if drawing {
-                RichText::new("✏ Interval — drag on plot").color(Color32::from_rgb(220, 170, 0))
+                RichText::new(format!("{} Interval — drag on plot", icon::PENCIL_SIMPLE)).color(Color32::from_rgb(220, 170, 0))
             } else {
                 RichText::new("+ Interval gate")
             };
@@ -3066,7 +3118,7 @@ impl FlowCytoApp {
                 self.drag_start = None; self.drag_current = None;
             }
             ui.separator();
-            if ui.button("📷 Save plot…").clicked() { self.request_plot_png(); }
+            if ui.button(format!("{} Save plot…", icon::CAMERA)).clicked() { self.request_plot_png(); }
         });
 
         // overlay mode: populations (1 sample) vs samples (workspace)
@@ -3257,7 +3309,7 @@ impl FlowCytoApp {
         let mut do_copy = false;
         ui.horizontal(|ui| {
             if ui.button("💾 Export CSV (tidy)").clicked() { do_export = true; }
-            if ui.button("📋 Copy (TSV)").on_hover_text("Copy the table as tab-separated text (paste into R/Excel)").clicked() { do_copy = true; }
+            if ui.button(format!("{} Copy (TSV)", icon::COPY)).on_hover_text("Copy the table as tab-separated text (paste into R/Excel)").clicked() { do_copy = true; }
             ui.label(RichText::new(format!("{} populations × {} channels", table.rows.len(), table.channels.len()))
                 .small().color(Color32::GRAY));
         });
@@ -3497,7 +3549,7 @@ impl FlowCytoApp {
             self.status = if got_done {
                 format!("Batch done: {} processed, {} skipped", n, ns)
             } else {
-                format!("⚠ Batch ended early ({} processed, {} skipped) — a sample may have failed", n, ns)
+                format!("{} Batch ended early ({} processed, {} skipped) — a sample may have failed", icon::WARNING, n, ns)
             };
         } else {
             ctx.request_repaint(); // keep ticking while the worker runs
@@ -3533,7 +3585,7 @@ impl FlowCytoApp {
             if ui.add_enabled(!running, egui::Button::new("▶ Run over all samples")).clicked() { do_run = true; }
             if running && ui.button("✖ Cancel").clicked() { do_cancel = true; }
             if self.batch.is_some() && !running && ui.button("💾 Export combined CSV").clicked() { do_export = true; }
-            if self.batch.is_some() && !running && ui.button("📋 Copy (TSV)").on_hover_text("Copy the visible table as tab-separated text").clicked() { do_copy = true; }
+            if self.batch.is_some() && !running && ui.button(format!("{} Copy (TSV)", icon::COPY)).on_hover_text("Copy the visible table as tab-separated text").clicked() { do_copy = true; }
         });
         ui.label(RichText::new(format!(
             "{} samples · {} gates · streamed on a worker thread (UI stays responsive)", self.samples.len(), self.gates.len()
@@ -3643,7 +3695,7 @@ impl FlowCytoApp {
         // ── Quick chart: one population's metric across samples, grouped by tag ──
         if !rows.is_empty() {
             ui.separator();
-            egui::CollapsingHeader::new("📊 Chart across samples").id_salt("batch_chart_hdr").show(ui, |ui| {
+            egui::CollapsingHeader::new(format!("{} Chart across samples", icon::CHART_BAR)).id_salt("batch_chart_hdr").show(ui, |ui| {
                 let cur_name = match self.batch_plot_pop {
                     None => "All events".to_string(),
                     Some(id) => self.gates.iter().find(|g| g.id == id).map(|g| g.name.clone()).unwrap_or_else(|| "All events".into()),
@@ -3731,7 +3783,7 @@ impl FlowCytoApp {
         let n_low = self.samples.iter().filter(|s| s.n_events.map(|n| n < QC_MIN_EVENTS).unwrap_or(false)).count();
         ui.heading(format!("Samples ({})", self.samples.len()));
         if n_low > 0 {
-            ui.label(RichText::new(format!("⚠ {} low-event tube(s)", n_low))
+            ui.label(RichText::new(format!("{} {} low-event tube(s)", icon::WARNING, n_low))
                 .small().color(Color32::from_rgb(220, 150, 50)));
         }
         let active = self.active_sample;
@@ -3742,13 +3794,13 @@ impl FlowCytoApp {
             for (i, s) in self.samples.iter_mut().enumerate() {
                 let low = s.n_events.map(|n| n < QC_MIN_EVENTS).unwrap_or(false);
                 let ev = s.n_events.map(fmt_count).unwrap_or_else(|| "?".into());
-                let lbl = format!("{}{}  · {} ev", if low { "⚠ " } else { "" }, s.name, ev);
+                let lbl = format!("{}{}  · {} ev", if low { format!("{} ", icon::WARNING) } else { String::new() }, s.name, ev);
                 let txt = if low { RichText::new(lbl).color(Color32::from_rgb(220, 150, 50)) } else { RichText::new(lbl) };
                 ui.horizontal(|ui| {
                     if ui.selectable_label(i == active, txt).clicked() { switch_to = Some(i); }
                     // reference-overlay toggle (👁) — overlay this sample behind the active one
                     let is_ref = self.ref_sample == Some(i);
-                    if i != active && ui.selectable_label(is_ref, "👁").on_hover_text("overlay behind active sample").clicked() {
+                    if i != active && ui.selectable_label(is_ref, icon::EYE).on_hover_text("overlay behind active sample").clicked() {
                         overlay_pick = Some(if is_ref { None } else { Some(i) });
                     }
                 });
@@ -3761,8 +3813,8 @@ impl FlowCytoApp {
             }
         });
         ui.horizontal(|ui| {
-            if ui.small_button("✕ Clear").clicked() { clear = true; }
-            if self.ref_sample.is_some() && ui.small_button("⊘ overlay").clicked() { overlay_pick = Some(None); }
+            if ui.small_button(format!("{} Clear", icon::X)).clicked() { clear = true; }
+            if self.ref_sample.is_some() && ui.small_button(format!("{} overlay", icon::EYE_SLASH)).clicked() { overlay_pick = Some(None); }
         });
         ui.separator();
 
@@ -3848,13 +3900,13 @@ impl FlowCytoApp {
             (false, false, false, false, false, false);
         ui.horizontal(|ui| {
             if override_active {
-                if ui.button("↺ Reset to embedded").clicked() { act_reset = true; }
+                if ui.button(format!("{} Reset to embedded", icon::ARROW_COUNTER_CLOCKWISE)).clicked() { act_reset = true; }
             } else {
-                let lbl = if has_embedded { "✏ Edit / Override" } else { "✏ Create override (identity)" };
+                let lbl = if has_embedded { format!("{} Edit / Override", icon::PENCIL_SIMPLE) } else { format!("{} Create override (identity)", icon::PENCIL_SIMPLE) };
                 if ui.button(lbl).clicked() { act_edit = true; }
             }
-            if ui.button("🧪 Compute from controls…").clicked() { act_compute = true; }
-            if ui.button("📂 Load matrix…").clicked() { act_load = true; }
+            if ui.button(format!("{} Compute from controls…", icon::FLASK)).clicked() { act_compute = true; }
+            if ui.button(format!("{} Load matrix…", icon::FOLDER_OPEN)).clicked() { act_load = true; }
             if active.is_some() && ui.button("💾 Save matrix…").clicked() { act_save = true; }
             if active.is_some() && ui.button("📝 Write new .fcs…").clicked() { act_write = true; }
         });
@@ -3869,7 +3921,7 @@ impl FlowCytoApp {
             let n = channels.len();
             let mx = max_off_diagonal(rows);
             if mx < 1e-9 {
-                ui.label(RichText::new("⚠ Identity matrix — NO real compensation encoded.")
+                ui.label(RichText::new(format!("{} Identity matrix — NO real compensation encoded.", icon::WARNING))
                     .color(Color32::from_rgb(220, 150, 50)).strong());
             } else {
                 ui.label(RichText::new(format!(
@@ -4049,9 +4101,9 @@ impl FlowCytoApp {
                 self.needs_reprocess = true;
                 if !self.do_compensate { self.do_compensate = true; }
                 self.status = if mism.is_empty() {
-                    "Computed spillover from controls ✓ (all stains matched filenames). Override active.".into()
+                    format!("Computed spillover from controls {} (all stains matched filenames). Override active.", icon::CHECK)
                 } else {
-                    format!("Computed spillover — ⚠ {} stain(s) disagree with filename: {}",
+                    format!("Computed spillover — {} {} stain(s) disagree with filename: {}", icon::WARNING,
                         mism.len(), mism.join("; "))
                 };
             }
@@ -4626,17 +4678,44 @@ fn build_menu() -> MenuState {
     }
 }
 
+/// Bundle the Inter UI font (Regular + SemiBold for headings) and the Phosphor icon
+/// font, so the whole app renders with crisp, consistent typography and line-icons
+/// instead of the built-in font + platform emoji.
+fn setup_fonts(ctx: &egui::Context) {
+    use egui::{FontData, FontDefinitions, FontFamily};
+    let mut fonts = FontDefinitions::default();
+    fonts.font_data.insert(
+        "Inter".to_owned(),
+        FontData::from_static(include_bytes!("../assets/fonts/Inter-Regular.ttf")),
+    );
+    fonts.font_data.insert(
+        "Inter-SemiBold".to_owned(),
+        FontData::from_static(include_bytes!("../assets/fonts/Inter-SemiBold.ttf")),
+    );
+    // Inter as the primary proportional face; keep egui's bundled font as a fallback
+    // for any glyph Inter lacks.
+    fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "Inter".to_owned());
+    // A dedicated SemiBold family for headings.
+    fonts.families.insert(
+        FontFamily::Name("heading".into()),
+        vec!["Inter-SemiBold".to_owned(), "Inter".to_owned()],
+    );
+    // Phosphor icon glyphs, merged into all families so icons render inline with text.
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    ctx.set_fonts(fonts);
+}
+
 /// One-time style setup: spacing, padding, rounded widgets, readable text sizes.
 /// (Spacing/text persist across the per-frame `set_visuals` calls.)
 fn setup_style(ctx: &egui::Context) {
-    use egui::{FontFamily::{Monospace, Proportional}, FontId, TextStyle};
+    use egui::{FontFamily::{self, Monospace, Proportional}, FontId, TextStyle};
     let mut style = (*ctx.style()).clone();
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
     style.spacing.button_padding = egui::vec2(8.0, 4.0);
     style.spacing.interact_size.y = 24.0;
     style.spacing.menu_margin = egui::Margin::same(6.0);
     style.text_styles = [
-        (TextStyle::Heading, FontId::new(18.0, Proportional)),
+        (TextStyle::Heading, FontId::new(16.5, FontFamily::Name("heading".into()))),
         (TextStyle::Body, FontId::new(14.0, Proportional)),
         (TextStyle::Button, FontId::new(14.0, Proportional)),
         (TextStyle::Monospace, FontId::new(13.0, Monospace)),
@@ -4645,20 +4724,83 @@ fn setup_style(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
-/// Dark/light visuals with a teal accent (matching the app icon) and softer
-/// rounded widgets. Rebuilt each frame because `set_visuals` resets visuals.
+/// Dark/light visuals with a teal accent (matching the app icon), cohesive panel
+/// tones, soft shadows, and accent-tinted widget states. Rebuilt each frame because
+/// `set_visuals` resets visuals.
 fn themed_visuals(dark: bool) -> egui::Visuals {
     let mut v = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
     let accent = Color32::from_rgb(38, 162, 156);
     v.selection.bg_fill = accent.linear_multiply(if dark { 0.55 } else { 0.35 });
     v.selection.stroke = Stroke::new(1.0, accent);
     v.hyperlink_color = accent;
-    let r = egui::Rounding::same(5.0);
-    v.widgets.noninteractive.rounding = r;
-    v.widgets.inactive.rounding = r;
-    v.widgets.hovered.rounding = r;
-    v.widgets.active.rounding = r;
-    v.window_rounding = egui::Rounding::same(8.0);
+
+    if dark {
+        let panel = Color32::from_rgb(30, 34, 41);
+        let widget = Color32::from_rgb(42, 47, 56);
+        let widget_hi = Color32::from_rgb(52, 58, 69);
+        v.window_fill = Color32::from_rgb(24, 27, 33);
+        v.panel_fill = panel;
+        v.faint_bg_color = Color32::from_rgb(37, 42, 50);     // table stripe / faint fills
+        v.extreme_bg_color = Color32::from_rgb(18, 20, 25);   // text edits, plot background
+        v.widgets.noninteractive.bg_fill = panel;
+        v.widgets.noninteractive.weak_bg_fill = panel;
+        v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(46, 51, 60));
+        v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(192, 198, 207));
+        v.widgets.inactive.bg_fill = widget;
+        v.widgets.inactive.weak_bg_fill = widget;
+        v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(58, 64, 75));
+        v.widgets.inactive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(208, 213, 221));
+        v.widgets.hovered.bg_fill = widget_hi;
+        v.widgets.hovered.weak_bg_fill = widget_hi;
+        v.widgets.hovered.bg_stroke = Stroke::new(1.0, accent.linear_multiply(0.75));
+        v.widgets.active.bg_fill = accent.linear_multiply(0.9);
+        v.widgets.active.weak_bg_fill = accent.linear_multiply(0.9);
+        v.widgets.active.bg_stroke = Stroke::new(1.0, accent);
+    } else {
+        let panel = Color32::from_rgb(252, 252, 253);
+        let widget = Color32::from_rgb(255, 255, 255);
+        let widget_hi = Color32::from_rgb(236, 245, 244);
+        v.window_fill = Color32::from_rgb(246, 247, 250);
+        v.panel_fill = panel;
+        v.faint_bg_color = Color32::from_rgb(241, 243, 246);
+        v.extreme_bg_color = Color32::from_rgb(255, 255, 255);
+        v.widgets.noninteractive.bg_fill = panel;
+        v.widgets.noninteractive.weak_bg_fill = panel;
+        v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(223, 227, 233));
+        v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(58, 64, 72));
+        v.widgets.inactive.bg_fill = widget;
+        v.widgets.inactive.weak_bg_fill = Color32::from_rgb(244, 246, 248);
+        v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(214, 219, 226));
+        v.widgets.inactive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(44, 49, 57));
+        v.widgets.hovered.bg_fill = widget_hi;
+        v.widgets.hovered.weak_bg_fill = widget_hi;
+        v.widgets.hovered.bg_stroke = Stroke::new(1.0, accent.linear_multiply(0.8));
+        v.widgets.active.bg_fill = accent.linear_multiply(0.22);
+        v.widgets.active.weak_bg_fill = accent.linear_multiply(0.22);
+        v.widgets.active.bg_stroke = Stroke::new(1.0, accent);
+    }
+
+    let r = egui::Rounding::same(6.0);
+    for w in [
+        &mut v.widgets.noninteractive, &mut v.widgets.inactive,
+        &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open,
+    ] {
+        w.rounding = r;
+    }
+    v.window_rounding = egui::Rounding::same(10.0);
+    v.menu_rounding = egui::Rounding::same(8.0);
+    v.window_shadow = egui::epaint::Shadow {
+        offset: egui::vec2(0.0, 4.0),
+        blur: 18.0,
+        spread: 0.0,
+        color: Color32::from_black_alpha(if dark { 96 } else { 38 }),
+    };
+    v.popup_shadow = egui::epaint::Shadow {
+        offset: egui::vec2(0.0, 3.0),
+        blur: 12.0,
+        spread: 0.0,
+        color: Color32::from_black_alpha(if dark { 90 } else { 30 }),
+    };
     v
 }
 
@@ -4669,6 +4811,7 @@ pub fn run_gui(initial_file: Option<&Path>) {
         ..Default::default()
     };
     eframe::run_native("flowcyto", options, Box::new(|cc| {
+        setup_fonts(&cc.egui_ctx);
         setup_style(&cc.egui_ctx);
         let mut app = FlowCytoApp { recent_files: load_recent(), ..Default::default() };
         if let Some(p) = initial_file { app.load_file(p); }

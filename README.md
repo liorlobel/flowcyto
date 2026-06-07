@@ -76,7 +76,11 @@ compensation — to reopen later.
   switch tabs (⌘1–⌘5), toggle light/dark.
 - **Keyboard:** `R`/`E`/`P`/`Q` draw tools, `G` edit, `V`/`Esc` navigate,
   `Ctrl/Cmd+Z` undo, `1`–`5` switch tabs.
-- **📷 Save plot…** exports the current plot as a PNG.
+- **Appearance:** light/dark themes and five density colormaps — **Viridis**
+  (default), **Magma**, **Turbo**, **Cividis** (all perceptually-uniform and
+  colorblind-safe), and **Jet** (legacy). The chosen colormap is saved with the
+  session.
+- **Save plot** exports the current plot as a PNG.
 - **Check for updates:** the toolbar's **⟳ Updates** button (or **flowcyto →
   Check for Updates…** on macOS) compares your version against the latest GitHub
   release and opens the download page if there's a newer one. It's the app's only
