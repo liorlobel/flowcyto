@@ -17,7 +17,7 @@ use crate::compensation::{
 };
 use crate::fcs_write;
 use crate::fcs::FcsFile;
-use crate::gating::{effective_mask, gate_membership, Gate, GateShape};
+use crate::gating::{compute_own_masks, effective_mask, BoolOp, Gate, GateShape};
 use crate::popstats::{
     append_long_csv, append_long_csv_grouped, population_stats, PopulationStatsTable,
     LONG_CSV_HEADER, LONG_CSV_HEADER_GROUPED,
@@ -328,6 +328,8 @@ pub struct FlowCytoApp {
     next_gate_id: u32,
     gate_counts: HashMap<u32, (usize, usize)>, // id → (n_in_effective, n_parent)
     new_gate_parent: Option<u32>,
+    bool_op: BoolOp,                          // op for the boolean-gate builder
+    bool_refs: std::collections::HashSet<u32>, // gates selected in the boolean-gate builder
 
     draw_mode: DrawMode,
     drag_start: Option<[f64; 2]>,
@@ -396,6 +398,7 @@ impl Default for FlowCytoApp {
             data_gen: 0,
             gates: Vec::new(), undo_stack: Vec::new(), redo_stack: Vec::new(), next_gate_id: 1,
             gate_counts: HashMap::new(), new_gate_parent: None,
+            bool_op: BoolOp::And, bool_refs: std::collections::HashSet::new(),
             draw_mode: DrawMode::Navigate,
             drag_start: None, drag_current: None, poly_vertices: Vec::new(),
             selected_gate: None,
@@ -786,13 +789,7 @@ impl FlowCytoApp {
     /// Effective membership mask of a population (AND of the gate with its ancestors).
     fn pop_mask(&self, pop: u32) -> Vec<bool> {
         let fcs = match &self.fcs { Some(f) => f, None => return Vec::new() };
-        let n = fcs.n_params();
-        let mut own: HashMap<u32, Vec<bool>> = HashMap::new();
-        for g in &self.gates {
-            let m = gate_membership(g, &self.compensated, &fcs.parameters, fcs.n_events, n)
-                .unwrap_or_else(|_| vec![false; fcs.n_events]);
-            own.insert(g.id, m);
-        }
+        let own = compute_own_masks(&self.gates, &self.compensated, &fcs.parameters, fcs.n_events);
         let by_id: HashMap<u32, &Gate> = self.gates.iter().map(|g| (g.id, g)).collect();
         effective_mask(pop, &by_id, &own, fcs.n_events)
     }
@@ -842,12 +839,7 @@ impl FlowCytoApp {
         let n = fcs.n_params();
         if self.compensated.len() < fcs.n_events * n { return; } // not yet processed
 
-        let mut own: HashMap<u32, Vec<bool>> = HashMap::new();
-        for g in &self.gates {
-            let m = gate_membership(g, &self.compensated, &fcs.parameters, fcs.n_events, n)
-                .unwrap_or_else(|_| vec![false; fcs.n_events]);
-            own.insert(g.id, m);
-        }
+        let own = compute_own_masks(&self.gates, &self.compensated, &fcs.parameters, fcs.n_events);
         let by_id: HashMap<u32, &Gate> = self.gates.iter().map(|g| (g.id, g)).collect();
 
         let mut counts = HashMap::new();
@@ -1024,6 +1016,31 @@ impl FlowCytoApp {
         self.status = format!("Added interval gate {}", id);
     }
 
+    /// Create a Boolean (AND/OR/NOT) gate combining the selected populations.
+    fn commit_boolean(&mut self, op: BoolOp, refs: Vec<u32>) {
+        if refs.is_empty() { self.status = "Select at least one gate for the boolean.".into(); return; }
+        if op == BoolOp::Not && refs.len() != 1 { self.status = "NOT combines exactly one gate.".into(); return; }
+        self.push_undo();
+        let ref_names: Vec<String> = refs.iter()
+            .filter_map(|r| self.gates.iter().find(|g| g.id == *r).map(|g| g.name.clone())).collect();
+        let name = match op {
+            BoolOp::And => ref_names.join(" & "),
+            BoolOp::Or => ref_names.join(" | "),
+            BoolOp::Not => format!("NOT {}", ref_names.first().cloned().unwrap_or_default()),
+        };
+        let id = self.next_gate_id;
+        self.next_gate_id += 1;
+        self.gates.push(Gate {
+            id, name, parent: self.new_gate_parent,
+            x_channel: String::new(), y_channel: String::new(),
+            x_transform: AxisTransform::Linear, y_transform: AxisTransform::Linear,
+            shape: GateShape::Boolean { op, refs },
+            quad_group: None,
+        });
+        self.needs_regate = true;
+        self.status = "Added boolean gate".into();
+    }
+
     /// Finish the in-progress polygon, committing it to the right channel pair —
     /// the active grid cell's channels in grid mode, else the single-plot axes.
     fn finish_polygon(&mut self) {
@@ -1072,14 +1089,7 @@ impl FlowCytoApp {
 
                 let mask: Vec<bool> = if let Some(gid) = pop {
                     if !missing_gate_channels(&self.gates, &fcs).is_empty() { continue; }
-                    let mut own: HashMap<u32, Vec<bool>> = HashMap::new();
-                    for g in &self.gates {
-                        // On membership error (missing channel), use all-false so the
-                        // population reads 0 rather than inheriting its parent's mask.
-                        let m = gate_membership(g, &ev, &fcs.parameters, ne, np)
-                            .unwrap_or_else(|_| vec![false; ne]);
-                        own.insert(g.id, m);
-                    }
+                    let own = compute_own_masks(&self.gates, &ev, &fcs.parameters, ne);
                     let by_id: HashMap<u32, &Gate> = self.gates.iter().map(|g| (g.id, g)).collect();
                     effective_mask(gid, &by_id, &own, ne)
                 } else {
@@ -1113,14 +1123,10 @@ impl FlowCytoApp {
             let centers: Vec<f64> = (0..B).map(|b| lo + (b as f64 + 0.5) * span / B as f64).collect();
             let binof = |x: f64| (((x - lo) / span * B as f64) as isize).clamp(0, B as isize - 1) as usize;
 
-            let mut own: HashMap<u32, Vec<bool>> = HashMap::new();
-            if let Some(fcs) = &self.fcs {
-                for g in &self.gates {
-                    let m = gate_membership(g, &self.compensated, &fcs.parameters, n_events, n_params)
-                        .unwrap_or_else(|_| vec![false; n_events]);
-                    own.insert(g.id, m);
-                }
-            }
+            let own = match &self.fcs {
+                Some(fcs) => compute_own_masks(&self.gates, &self.compensated, &fcs.parameters, n_events),
+                None => HashMap::new(),
+            };
             let by_id: HashMap<u32, &Gate> = self.gates.iter().map(|g| (g.id, g)).collect();
             let mut series = Vec::new();
             if !self.hist_all_hidden {
@@ -1618,6 +1624,36 @@ impl FlowCytoApp {
             if ui.button("📁 Load").clicked() { self.load_gates(); }
         });
 
+        // Boolean (AND/OR/NOT) gate builder.
+        if !self.gates.is_empty() {
+            let gate_list: Vec<(u32, String)> = self.gates.iter().map(|g| (g.id, g.name.clone())).collect();
+            let mut create_bool = false;
+            egui::CollapsingHeader::new("➕ Boolean gate").id_salt("bool_builder").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Op:");
+                    ui.selectable_value(&mut self.bool_op, BoolOp::And, "AND");
+                    ui.selectable_value(&mut self.bool_op, BoolOp::Or, "OR");
+                    ui.selectable_value(&mut self.bool_op, BoolOp::Not, "NOT");
+                });
+                for (id, name) in &gate_list {
+                    let mut on = self.bool_refs.contains(id);
+                    if ui.checkbox(&mut on, name).changed() {
+                        if on { self.bool_refs.insert(*id); } else { self.bool_refs.remove(id); }
+                    }
+                }
+                let hint = if self.bool_op == BoolOp::Not { "(pick exactly 1)" } else { "(pick 2+)" };
+                ui.horizontal(|ui| {
+                    if ui.button("Create").clicked() { create_bool = true; }
+                    ui.label(RichText::new(hint).small().color(Color32::GRAY));
+                });
+            });
+            if create_bool {
+                let refs: Vec<u32> = gate_list.iter().map(|(id, _)| *id).filter(|id| self.bool_refs.contains(id)).collect();
+                self.commit_boolean(self.bool_op, refs);
+                self.bool_refs.clear();
+            }
+        }
+
         ui.separator();
 
         // Hierarchical gate list (depth-first).
@@ -1631,9 +1667,10 @@ impl FlowCytoApp {
             let (color, _) = gate_color(gid);
             let (n_in, n_parent) = self.gate_counts.get(&gid).copied().unwrap_or((0, 0));
             let pct_par = if n_parent > 0 { 100.0 * n_in as f64 / n_parent as f64 } else { 0.0 };
-            let (name, shape_lbl, xch, ych) = {
+            let (name, shape_lbl, xch, ych, is_bool) = {
                 let g = &self.gates[idx];
-                (g.name.clone(), shape_label(&g.shape), g.x_channel.clone(), g.y_channel.clone())
+                (g.name.clone(), shape_label(&g.shape), g.x_channel.clone(), g.y_channel.clone(),
+                 matches!(g.shape, GateShape::Boolean { .. }))
             };
 
             ui.horizontal(|ui| {
@@ -1660,10 +1697,12 @@ impl FlowCytoApp {
             });
             ui.horizontal(|ui| {
                 ui.add_space(depth as f32 * 14.0 + 16.0);
-                ui.label(RichText::new(format!(
-                    "{} · {}×{} · {}/{} ({:.1}%)",
-                    shape_lbl, xch, ych, n_in, n_parent, pct_par
-                )).small().color(Color32::GRAY));
+                let detail = if is_bool {
+                    format!("{} · {}/{} ({:.1}%)", shape_lbl, n_in, n_parent, pct_par)
+                } else {
+                    format!("{} · {}×{} · {}/{} ({:.1}%)", shape_lbl, xch, ych, n_in, n_parent, pct_par)
+                };
+                ui.label(RichText::new(detail).small().color(Color32::GRAY));
             });
             // Reparent combo
             ui.horizontal(|ui| {
@@ -1764,6 +1803,10 @@ impl FlowCytoApp {
                             ui.horizontal(|ui| { ui.add_space(ind);
                                 ui.label(RichText::new("polygon — redraw to change").small().color(Color32::GRAY)); });
                         }
+                        GateShape::Boolean { .. } => {
+                            ui.horizontal(|ui| { ui.add_space(ind);
+                                ui.label(RichText::new("boolean gate — delete & recreate to change").small().color(Color32::GRAY)); });
+                        }
                     }
                     if started { self.push_undo_state(before); }
                     if changed { self.needs_regate = true; }
@@ -1786,8 +1829,11 @@ impl FlowCytoApp {
             let parent_of = self.gates.iter().find(|g| g.id == gid).and_then(|g| g.parent);
             for g in &mut self.gates {
                 if g.parent == Some(gid) { g.parent = parent_of; }
+                // Drop the deleted gate from any boolean combination that referenced it.
+                if let GateShape::Boolean { refs, .. } = &mut g.shape { refs.retain(|r| *r != gid); }
             }
             self.gates.retain(|g| g.id != gid);
+            self.bool_refs.remove(&gid);
             if self.new_gate_parent == Some(gid) { self.new_gate_parent = parent_of; }
             if self.hist_sample_pop == Some(gid) { self.hist_sample_pop = None; self.hist_cache = None; }
             if self.selected_gate == Some(gid) { self.selected_gate = None; }
@@ -4037,6 +4083,7 @@ fn shape_display_bbox(s: &GateShape) -> Option<(f64, f64, f64, f64)> {
             Some((xmn, xmx, ymn, ymx))
         }
         GateShape::Range { .. } => None,
+        GateShape::Boolean { .. } => None,
     }
 }
 
@@ -4046,6 +4093,7 @@ fn shape_label(s: &GateShape) -> &'static str {
         GateShape::Ellipse { .. } => "ellipse",
         GateShape::Polygon { .. } => "polygon",
         GateShape::Range { .. } => "interval",
+        GateShape::Boolean { .. } => "boolean",
     }
 }
 
@@ -4169,6 +4217,7 @@ fn gate_handles(shape: &GateShape) -> Vec<[f64; 2]> {
         }
         GateShape::Polygon { vertices } => vertices.clone(),
         GateShape::Range { x_min, x_max } => vec![[*x_min, 0.0], [*x_max, 0.0]],
+        GateShape::Boolean { .. } => Vec::new(),
     }
 }
 
@@ -4194,6 +4243,7 @@ fn apply_gate_handle(shape: &mut GateShape, h: usize, gx: f64, gy: f64) {
         }
         GateShape::Polygon { vertices } => { if h < vertices.len() { vertices[h] = [gx, gy]; } }
         GateShape::Range { x_min, x_max } => { if h == 0 { *x_min = gx; } else { *x_max = gx; } }
+        GateShape::Boolean { .. } => {}
     }
 }
 
@@ -4206,6 +4256,7 @@ fn translate_shape(shape: &mut GateShape, dx: f64, dy: f64) {
         GateShape::Ellipse { cx, cy, .. } => { *cx += dx; *cy += dy; }
         GateShape::Polygon { vertices } => { for v in vertices { v[0] += dx; v[1] += dy; } }
         GateShape::Range { x_min, x_max } => { *x_min += dx; *x_max += dx; }
+        GateShape::Boolean { .. } => {}
     }
 }
 

@@ -44,7 +44,14 @@ pub enum GateShape {
     /// 1-D interval on the x channel only (drawn on a histogram). `y` is ignored;
     /// for such gates the Gate's y_channel/y_transform mirror x.
     Range { x_min: f64, x_max: f64 },
+    /// Logical combination of other gates' populations (AND / OR / NOT). Not drawn
+    /// on the plot; membership comes from the referenced gates' effective masks.
+    Boolean { op: BoolOp, refs: Vec<u32> },
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoolOp { And, Or, Not }
 
 impl GateShape {
     /// Point-in-shape test, in display coordinates.
@@ -65,6 +72,7 @@ impl GateShape {
             }
             GateShape::Polygon { vertices } => point_in_polygon(x, y, vertices),
             GateShape::Range { x_min, x_max } => x >= *x_min && x <= *x_max,
+            GateShape::Boolean { .. } => false, // not geometric — handled by compute_own_masks
         }
     }
 
@@ -94,6 +102,7 @@ impl GateShape {
             }
             // Range is rendered specially on the histogram; no 2-D outline.
             GateShape::Range { .. } => Vec::new(),
+            GateShape::Boolean { .. } => Vec::new(), // not drawn on the plot
         }
     }
 
@@ -112,6 +121,7 @@ impl GateShape {
                 [cx, cy]
             }
             GateShape::Range { x_min, x_max } => [(x_min + x_max) / 2.0, 0.0],
+            GateShape::Boolean { .. } => [0.0, 0.0],
         }
     }
 }
@@ -124,6 +134,10 @@ pub fn gate_membership(
     n_events: usize,
     n_params: usize,
 ) -> Result<Vec<bool>> {
+    // Boolean gates aren't geometric — their mask is built by `compute_own_masks`.
+    if let GateShape::Boolean { .. } = gate.shape {
+        return Ok(vec![false; n_events]);
+    }
     let xi = param_idx(params, &gate.x_channel)?;
     let yi = param_idx(params, &gate.y_channel)?;
     let xt = gate.x_transform.compile();
@@ -156,6 +170,86 @@ pub fn gate_tree_order(gates: &[Gate]) -> Vec<(u32, usize)> {
         }
     }
     out
+}
+
+/// Own membership masks for every gate, handling both geometric gates and Boolean
+/// (AND/OR/NOT) combinations of other gates' *effective* populations. Boolean gates
+/// are resolved in dependency order (a Boolean may reference another Boolean).
+pub fn compute_own_masks(
+    gates: &[Gate],
+    events: &[f64],
+    params: &[Parameter],
+    n_events: usize,
+) -> std::collections::HashMap<u32, Vec<bool>> {
+    let n_params = params.len();
+    let mut own: HashMap<u32, Vec<bool>> = HashMap::new();
+    // Pass 1: geometric gates.
+    for g in gates {
+        if !matches!(g.shape, GateShape::Boolean { .. }) {
+            let m = gate_membership(g, events, params, n_events, n_params)
+                .unwrap_or_else(|_| vec![false; n_events]);
+            own.insert(g.id, m);
+        }
+    }
+    let by_id: HashMap<u32, &Gate> = gates.iter().map(|g| (g.id, g)).collect();
+    // Pass 2: resolve Boolean gates whose refs (and their ancestors) are all ready.
+    let mut pending: Vec<&Gate> = gates.iter().filter(|g| matches!(g.shape, GateShape::Boolean { .. })).collect();
+    let mut guard = 0;
+    while !pending.is_empty() {
+        guard += 1;
+        let mut still = Vec::new();
+        let mut progressed = false;
+        for g in pending {
+            if let GateShape::Boolean { op, refs } = &g.shape {
+                let ready = refs.iter().all(|r| ref_ready(*r, &by_id, &own));
+                if !ready || guard > 1000 {
+                    if guard > 1000 { own.insert(g.id, vec![false; n_events]); }
+                    else { still.push(g); }
+                    continue;
+                }
+                own.insert(g.id, boolean_mask(*op, refs, &by_id, &own, n_events));
+                progressed = true;
+            }
+        }
+        pending = still;
+        if !progressed {
+            for g in &pending { own.insert(g.id, vec![false; n_events]); } // unresolvable (cycle/missing)
+            break;
+        }
+    }
+    own
+}
+
+/// A reference gate is ready when it and all its ancestors have own masks computed.
+fn ref_ready(id: u32, by_id: &HashMap<u32, &Gate>, own: &HashMap<u32, Vec<bool>>) -> bool {
+    let mut cur = Some(id);
+    let mut guard = 0;
+    while let Some(c) = cur {
+        guard += 1; if guard > 1000 { return false; }
+        if !own.contains_key(&c) { return false; }
+        cur = by_id.get(&c).and_then(|g| g.parent);
+    }
+    true
+}
+
+fn boolean_mask(op: BoolOp, refs: &[u32], by_id: &HashMap<u32, &Gate>, own: &HashMap<u32, Vec<bool>>, n: usize) -> Vec<bool> {
+    match op {
+        BoolOp::And => {
+            if refs.is_empty() { return vec![false; n]; }
+            let mut m = vec![true; n];
+            for r in refs { let e = effective_mask(*r, by_id, own, n); for i in 0..n { m[i] &= e[i]; } }
+            m
+        }
+        BoolOp::Or => {
+            let mut m = vec![false; n];
+            for r in refs { let e = effective_mask(*r, by_id, own, n); for i in 0..n { m[i] |= e[i]; } }
+            m
+        }
+        BoolOp::Not => match refs.first() {
+            Some(r) => effective_mask(*r, by_id, own, n).iter().map(|b| !b).collect(),
+            None => vec![false; n],
+        },
+    }
 }
 
 /// Effective mask of a gate = own mask AND all ancestors' masks.
@@ -206,13 +300,8 @@ pub fn apply_gates(
     params: &[Parameter],
     n_events: usize,
 ) -> Result<Vec<GateResult>> {
-    let n_params = params.len();
-
-    // Own masks
-    let mut own: HashMap<u32, Vec<bool>> = HashMap::new();
-    for g in gates {
-        own.insert(g.id, gate_membership(g, events, params, n_events, n_params)?);
-    }
+    // Own masks (geometric + Boolean combinations).
+    let own = compute_own_masks(gates, events, params, n_events);
     let by_id: HashMap<u32, &Gate> = gates.iter().map(|g| (g.id, g)).collect();
 
     let mut results = Vec::with_capacity(gates.len());
@@ -440,6 +529,39 @@ mod tests {
         assert_eq!(res[1].n_parent, 3);
         assert!((res[1].pct_parent() - 100.0 * 2.0 / 3.0).abs() < 1e-9);
         assert!((res[1].pct_total() - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn boolean_gates_and_or_not() {
+        let params = vec![param(1, "X"), param(2, "Y")];
+        // 4 events at x = 1, 2, 3, 8.
+        let events = vec![1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 8.0, 0.0];
+        let a = gate(1, "A", None, GateShape::Rect { x_min: 0.0, x_max: 2.5, y_min: -1.0, y_max: 1.0 }); // {0,1}
+        let b = gate(2, "B", None, GateShape::Rect { x_min: 1.5, x_max: 9.0, y_min: -1.0, y_max: 1.0 }); // {1,2,3}
+        let and = gate(3, "A&B", None, GateShape::Boolean { op: BoolOp::And, refs: vec![1, 2] });
+        let or = gate(4, "A|B", None, GateShape::Boolean { op: BoolOp::Or, refs: vec![1, 2] });
+        let not = gate(5, "!A", None, GateShape::Boolean { op: BoolOp::Not, refs: vec![1] });
+        let gates = vec![a, b, and, or, not];
+        let own = compute_own_masks(&gates, &events, &params, 4);
+        let cnt = |id: u32| own[&id].iter().filter(|&&x| x).count();
+        assert_eq!(cnt(1), 2);
+        assert_eq!(cnt(2), 3);
+        assert_eq!(cnt(3), 1, "A AND B");
+        assert_eq!(cnt(4), 4, "A OR B");
+        assert_eq!(cnt(5), 2, "NOT A");
+    }
+
+    #[test]
+    fn boolean_gate_referencing_boolean_resolves() {
+        let params = vec![param(1, "X"), param(2, "Y")];
+        let events = vec![1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 8.0, 0.0];
+        let a = gate(1, "A", None, GateShape::Rect { x_min: 0.0, x_max: 2.5, y_min: -1.0, y_max: 1.0 }); // {0,1}
+        let not_a = gate(2, "!A", None, GateShape::Boolean { op: BoolOp::Not, refs: vec![1] });          // {2,3}
+        let b = gate(3, "B", None, GateShape::Rect { x_min: 2.5, x_max: 3.5, y_min: -1.0, y_max: 1.0 }); // {2}
+        let nested = gate(4, "!A & B", None, GateShape::Boolean { op: BoolOp::And, refs: vec![2, 3] });  // {2}
+        let gates = vec![a, not_a, b, nested];
+        let own = compute_own_masks(&gates, &events, &params, 4);
+        assert_eq!(own[&4].iter().filter(|&&x| x).count(), 1, "boolean of a boolean");
     }
 
     #[test]

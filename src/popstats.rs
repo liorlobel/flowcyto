@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 use crate::fcs::Parameter;
-use crate::gating::{effective_mask, gate_membership, gate_tree_order, Gate};
+use crate::gating::{compute_own_masks, effective_mask, gate_tree_order, Gate};
 
 #[derive(Clone)]
 pub struct PopulationStat {
@@ -44,16 +44,8 @@ pub fn population_stats(
     let n_params = params.len();
     let channels: Vec<String> = stat_channels.iter().map(|&i| params[i].name.clone()).collect();
 
-    // Own membership per gate, then effective (AND with ancestors).
-    // On error (e.g. a channel this sample lacks), use an all-false mask so the
-    // population reads 0 — NOT skipped, which would make `effective_mask` collapse
-    // it to its parent's mask and report the parent count as a real population.
-    let mut own: HashMap<u32, Vec<bool>> = HashMap::new();
-    for g in gates {
-        let m = gate_membership(g, events, params, n_events, n_params)
-            .unwrap_or_else(|_| vec![false; n_events]);
-        own.insert(g.id, m);
-    }
+    // Own membership per gate (geometric + Boolean), then effective (AND with ancestors).
+    let own = compute_own_masks(gates, events, params, n_events);
     let by_id: HashMap<u32, &Gate> = gates.iter().map(|g| (g.id, g)).collect();
 
     let mut rows = Vec::with_capacity(gates.len() + 1);
