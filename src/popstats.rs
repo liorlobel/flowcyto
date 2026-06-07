@@ -93,7 +93,7 @@ fn stat_row(
                 vals.push(events[ev * n_params + ci]);
             }
         }
-        let (med, mean, cv) = med_mean_cv(&mut vals);
+        let (med, mean, cv) = med_mean_cv(&vals);
         medians.push(med);
         means.push(mean);
         cvs.push(cv);
@@ -105,23 +105,34 @@ fn stat_row(
     }
 }
 
-/// Median (R-style: average of two middle for even N), mean, CV% — single pass-ish.
-fn med_mean_cv(vals: &mut [f64]) -> (f64, f64, f64) {
-    let n = vals.len();
+/// Median (R-style: average of two middle for even N), mean, CV%.
+/// Non-finite values are dropped first so a single poisoned event (e.g. a NaN from a
+/// bad compensation matrix) can't NaN the whole population's MFI, and the sort stays a
+/// valid total order. For all-finite data this is identical to a plain reduction.
+fn med_mean_cv(vals: &[f64]) -> (f64, f64, f64) {
+    let mut v: Vec<f64> = vals.iter().copied().filter(|x| x.is_finite()).collect();
+    let n = v.len();
     if n == 0 {
         return (f64::NAN, f64::NAN, f64::NAN);
     }
-    let mean = vals.iter().sum::<f64>() / n as f64;
+    let mean = v.iter().sum::<f64>() / n as f64;
     let var = if n > 1 {
-        vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1) as f64
+        v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1) as f64
     } else {
         0.0
     };
     let sd = var.sqrt();
     let cv = if mean.abs() > 1e-12 { 100.0 * sd / mean.abs() } else { f64::NAN };
-    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let med = if n % 2 == 1 { vals[n / 2] } else { 0.5 * (vals[n / 2 - 1] + vals[n / 2]) };
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let med = if n % 2 == 1 { v[n / 2] } else { 0.5 * (v[n / 2 - 1] + v[n / 2]) };
     (med, mean, cv)
+}
+
+/// Format a stat cell for CSV: a non-finite value (e.g. an empty population's NaN MFI)
+/// becomes `NA`, which R `read.csv` / pandas parse as missing rather than coercing the
+/// whole column to text.
+fn csv_num(v: f64) -> String {
+    if v.is_finite() { format!("{:.4}", v) } else { "NA".to_string() }
 }
 
 // ── Tidy CSV (long format, R-friendly) ──────────────────────────────────────
@@ -144,10 +155,10 @@ pub fn append_long_csv_grouped(out: &mut String, group: &str, sample: &str, tabl
     for r in &table.rows {
         for (k, ch) in table.channels.iter().enumerate() {
             let _ = writeln!(
-                out, "{},{},{},{},{},{},{:.4},{:.4},{},{:.4},{:.4},{:.4}",
+                out, "{},{},{},{},{},{},{:.4},{:.4},{},{},{},{}",
                 esc(group), esc(sample), esc(&r.name), esc(&r.parent_name), r.depth,
                 r.count, r.pct_parent, r.pct_total, esc(ch),
-                r.medians[k], r.means[k], r.cvs[k],
+                csv_num(r.medians[k]), csv_num(r.means[k]), csv_num(r.cvs[k]),
             );
         }
     }
@@ -165,10 +176,10 @@ pub fn append_long_csv(out: &mut String, sample: &str, table: &PopulationStatsTa
     for r in &table.rows {
         for (k, ch) in table.channels.iter().enumerate() {
             let _ = writeln!(
-                out, "{},{},{},{},{},{:.4},{:.4},{},{:.4},{:.4},{:.4}",
+                out, "{},{},{},{},{},{:.4},{:.4},{},{},{},{}",
                 esc(sample), esc(&r.name), esc(&r.parent_name), r.depth,
                 r.count, r.pct_parent, r.pct_total, esc(ch),
-                r.medians[k], r.means[k], r.cvs[k],
+                csv_num(r.medians[k]), csv_num(r.means[k]), csv_num(r.cvs[k]),
             );
         }
     }
@@ -243,7 +254,7 @@ mod tests {
 
     #[test]
     fn med_mean_cv_known_values() {
-        let (med, mean, cv) = med_mean_cv(&mut [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]);
+        let (med, mean, cv) = med_mean_cv(&[2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]);
         assert_eq!(med, 4.5);
         assert!((mean - 5.0).abs() < 1e-12);
         // Sample SD (n-1): sum of squared deviations = 32, /(8-1) = 32/7.
@@ -253,8 +264,23 @@ mod tests {
 
     #[test]
     fn med_mean_cv_empty_is_nan() {
-        let (med, mean, cv) = med_mean_cv(&mut []);
+        let (med, mean, cv) = med_mean_cv(&[]);
         assert!(med.is_nan() && mean.is_nan() && cv.is_nan());
+    }
+
+    #[test]
+    fn med_mean_cv_drops_non_finite() {
+        // Audit M1d: a NaN/Inf among the values must not poison the median or mean.
+        let (med, mean, _cv) = med_mean_cv(&[2.0, f64::NAN, 4.0, f64::INFINITY, 6.0]);
+        assert_eq!(med, 4.0, "median over the finite {{2,4,6}}");
+        assert!((mean - 4.0).abs() < 1e-12, "mean over the finite {{2,4,6}}");
+    }
+
+    #[test]
+    fn csv_num_renders_non_finite_as_na() {
+        assert_eq!(csv_num(1234.5), "1234.5000");
+        assert_eq!(csv_num(f64::NAN), "NA");
+        assert_eq!(csv_num(f64::INFINITY), "NA");
     }
 
     #[test]

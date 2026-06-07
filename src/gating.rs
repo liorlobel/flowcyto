@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -183,12 +183,18 @@ pub fn compute_own_masks(
 ) -> std::collections::HashMap<u32, Vec<bool>> {
     let n_params = params.len();
     let mut own: HashMap<u32, Vec<bool>> = HashMap::new();
+    // Gates whose membership cannot be *evaluated* on this sample (e.g. their channel
+    // is absent). This is distinct from "evaluated to empty": a Boolean NOT/OR of an
+    // unevaluable population must itself be unevaluable (all-false), NOT inflate to the
+    // parent count. (A NOT of a *legitimately empty* gate correctly stays all-true.)
+    let mut unevaluable: HashSet<u32> = HashSet::new();
     // Pass 1: geometric gates.
     for g in gates {
         if !matches!(g.shape, GateShape::Boolean { .. }) {
-            let m = gate_membership(g, events, params, n_events, n_params)
-                .unwrap_or_else(|_| vec![false; n_events]);
-            own.insert(g.id, m);
+            match gate_membership(g, events, params, n_events, n_params) {
+                Ok(m) => { own.insert(g.id, m); }
+                Err(_) => { own.insert(g.id, vec![false; n_events]); unevaluable.insert(g.id); }
+            }
         }
     }
     let by_id: HashMap<u32, &Gate> = gates.iter().map(|g| (g.id, g)).collect();
@@ -207,7 +213,15 @@ pub fn compute_own_masks(
                     else { still.push(g); }
                     continue;
                 }
-                own.insert(g.id, boolean_mask(*op, refs, &by_id, &own, n_events));
+                // If any referenced population is unevaluable (itself or via an
+                // unevaluable ancestor), this combination can't be evaluated either —
+                // mark it all-false rather than inverting/dropping a missing input.
+                if refs.iter().any(|r| eff_unevaluable(*r, &by_id, &unevaluable)) {
+                    own.insert(g.id, vec![false; n_events]);
+                    unevaluable.insert(g.id);
+                } else {
+                    own.insert(g.id, boolean_mask(*op, refs, &by_id, &own, n_events));
+                }
                 progressed = true;
             }
         }
@@ -218,6 +232,21 @@ pub fn compute_own_masks(
         }
     }
     own
+}
+
+/// True if `id` — or any of its ancestors — could not be evaluated (e.g. a missing
+/// channel). Lets Boolean combinations distinguish an unevaluable population from a
+/// legitimately empty one. Walks the parent chain with a cycle guard.
+fn eff_unevaluable(id: u32, by_id: &HashMap<u32, &Gate>, unevaluable: &HashSet<u32>) -> bool {
+    let mut cur = Some(id);
+    let mut guard = 0;
+    while let Some(c) = cur {
+        guard += 1;
+        if guard > 1000 { break; }
+        if unevaluable.contains(&c) { return true; }
+        cur = by_id.get(&c).and_then(|g| g.parent);
+    }
+    false
 }
 
 /// A reference gate is ready when it and all its ancestors have own masks computed.
@@ -562,6 +591,48 @@ mod tests {
         let gates = vec![a, not_a, b, nested];
         let own = compute_own_masks(&gates, &events, &params, 4);
         assert_eq!(own[&4].iter().filter(|&&x| x).count(), 1, "boolean of a boolean");
+    }
+
+    #[test]
+    fn boolean_not_of_missing_channel_is_empty_not_parent() {
+        // Regression (audit H1): NOT of a gate whose channel is absent must report 0,
+        // not ~100% of its parent. Previously the missing-channel all-false own mask
+        // was inverted to all-true.
+        let params = vec![param(1, "X"), param(2, "Y")];
+        let events = vec![1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 8.0, 0.0]; // 4 events
+        let mut dead = gate(1, "Dead", None, GateShape::Rect { x_min: 0.0, x_max: 10.0, y_min: -1.0, y_max: 1.0 });
+        dead.x_channel = "ABSENT".to_string(); // channel not present in this sample
+        let live = gate(2, "Live", None, GateShape::Boolean { op: BoolOp::Not, refs: vec![1] });
+        let own = compute_own_masks(&[dead, live], &events, &params, 4);
+        assert_eq!(own[&1].iter().filter(|&&b| b).count(), 0, "missing-channel gate is empty");
+        assert_eq!(own[&2].iter().filter(|&&b| b).count(), 0, "NOT of unevaluable is empty, not parent");
+    }
+
+    #[test]
+    fn boolean_not_of_legitimately_empty_is_full() {
+        // Contrast with the above: NOT of a present-channel gate that genuinely matches
+        // 0 events IS all-true — the complement of an empty population is everything.
+        let params = vec![param(1, "X"), param(2, "Y")];
+        let events = vec![1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 8.0, 0.0]; // 4 events
+        let empty = gate(1, "empty", None, GateShape::Rect { x_min: 100.0, x_max: 200.0, y_min: -1.0, y_max: 1.0 });
+        let notg = gate(2, "!empty", None, GateShape::Boolean { op: BoolOp::Not, refs: vec![1] });
+        let own = compute_own_masks(&[empty, notg], &events, &params, 4);
+        assert_eq!(own[&1].iter().filter(|&&b| b).count(), 0);
+        assert_eq!(own[&2].iter().filter(|&&b| b).count(), 4, "complement of empty is everything");
+    }
+
+    #[test]
+    fn boolean_or_with_missing_channel_ref_is_unevaluable() {
+        // Regression (audit M4): OR must not silently drop a missing-channel ref
+        // (previously `A OR bad` collapsed to just A's count).
+        let params = vec![param(1, "X"), param(2, "Y")];
+        let events = vec![1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 8.0, 0.0]; // 4 events
+        let a = gate(1, "A", None, GateShape::Rect { x_min: 0.0, x_max: 2.5, y_min: -1.0, y_max: 1.0 }); // {0,1}
+        let mut bad = gate(2, "bad", None, GateShape::Rect { x_min: 0.0, x_max: 10.0, y_min: -1.0, y_max: 1.0 });
+        bad.x_channel = "ABSENT".to_string();
+        let or = gate(3, "A|bad", None, GateShape::Boolean { op: BoolOp::Or, refs: vec![1, 2] });
+        let own = compute_own_masks(&[a, bad, or], &events, &params, 4);
+        assert_eq!(own[&3].iter().filter(|&&b| b).count(), 0, "OR with an unevaluable ref is unevaluable");
     }
 
     #[test]

@@ -54,7 +54,9 @@ impl AxisTransform {
     pub fn compile(&self) -> CompiledTransform {
         match self {
             AxisTransform::Linear => CompiledTransform::Linear,
-            AxisTransform::Log { floor } => CompiledTransform::Log { floor: *floor },
+            // Clamp floor positive so log10 stays finite even if a deserialized session
+            // carries a non-positive floor (the UI only ever sets floor = 1.0).
+            AxisTransform::Log { floor } => CompiledTransform::Log { floor: floor.max(f64::MIN_POSITIVE) },
             AxisTransform::Asinh { cofactor } => {
                 CompiledTransform::Asinh { cofactor: *cofactor }
             }
@@ -176,6 +178,15 @@ mod tests {
         // Values below the floor clamp to log10(floor) = 0.
         assert_eq!(t.compile().forward(0.5), 0.0);
         assert_eq!(t.compile().forward(-50.0), 0.0);
+    }
+
+    #[test]
+    fn log_floor_non_positive_is_clamped_finite() {
+        // Audit L5: a deserialized Log with floor <= 0 must not emit -inf/NaN.
+        let c = AxisTransform::Log { floor: 0.0 }.compile();
+        assert!(c.forward(-100.0).is_finite());
+        assert!(c.forward(0.0).is_finite());
+        assert!(AxisTransform::Log { floor: -5.0 }.compile().forward(1.0).is_finite());
     }
 
     #[test]

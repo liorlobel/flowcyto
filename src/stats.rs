@@ -19,6 +19,10 @@ pub struct Stats {
 
 impl Stats {
     pub fn compute(name: &str, values: &[f64]) -> Self {
+        // Drop non-finite values up front: they would mis-sort the median/percentiles
+        // (NaN compares Equal to everything) and poison mean/SD. For all-finite data
+        // this is a no-op.
+        let values: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
         let n = values.len();
         if n == 0 {
             return Self::empty(name);
@@ -148,6 +152,15 @@ mod tests {
         assert_eq!(s.median, 42.0);
         assert_eq!(s.p05, 42.0);
         assert_eq!(s.p95, 42.0);
+    }
+
+    #[test]
+    fn compute_drops_non_finite() {
+        // Audit M1d: NaN/Inf must not poison the median/mean of the CLI stats.
+        let s = Stats::compute("X", &[2.0, f64::NAN, 4.0, f64::INFINITY, 6.0]);
+        assert_eq!(s.n, 3);
+        assert_eq!(s.median, 4.0);
+        assert!((s.mean - 4.0).abs() < 1e-12);
     }
 
     #[test]

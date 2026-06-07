@@ -65,7 +65,7 @@ enum Command {
         compensate: bool,
         #[arg(long, value_enum, default_value = "none")]
         transform: TransformArg,
-        #[arg(long, default_value_t = 150.0)]
+        #[arg(long, default_value_t = 150.0, value_parser = parse_positive)]
         cofactor: f64,
     },
 
@@ -78,7 +78,7 @@ enum Command {
         compensate: bool,
         #[arg(long, value_enum, default_value = "none")]
         transform: TransformArg,
-        #[arg(long, default_value_t = 150.0)]
+        #[arg(long, default_value_t = 150.0, value_parser = parse_positive)]
         cofactor: f64,
     },
 
@@ -91,7 +91,7 @@ enum Command {
         compensate: bool,
         #[arg(long, value_enum, default_value = "none")]
         transform: TransformArg,
-        #[arg(long, default_value_t = 150.0)]
+        #[arg(long, default_value_t = 150.0, value_parser = parse_positive)]
         cofactor: f64,
     },
 
@@ -144,7 +144,7 @@ enum Command {
         method: MethodArg,
         #[arg(long)]
         compensate: bool,
-        #[arg(long, default_value_t = 150.0)]
+        #[arg(long, default_value_t = 150.0, value_parser = parse_positive)]
         cofactor: f64,
         // logicle params
         #[arg(long, default_value_t = 262144.0)]
@@ -172,6 +172,13 @@ enum MethodArg {
 enum TransformArg {
     None,
     Asinh,
+}
+
+/// clap value parser: the asinh cofactor divides the data, so it must be positive and
+/// finite (0 → inf/NaN, negative → silently sign-flipped).
+fn parse_positive(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|_| format!("`{s}` is not a number"))?;
+    if v.is_finite() && v > 0.0 { Ok(v) } else { Err("must be a positive number".into()) }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────
@@ -256,7 +263,10 @@ fn cmd_transform_dump(
         None => Box::new(std::io::BufWriter::new(std::io::stdout())),
     };
     use std::io::Write;
-    writeln!(out, "raw,transformed")?;
+    // With --compensate the first column holds post-compensation values, not raw —
+    // label it honestly so a flowCore comparison isn't fooled.
+    let in_label = if do_comp { "compensated" } else { "raw" };
+    writeln!(out, "{in_label},transformed")?;
     for v in raw {
         writeln!(out, "{:.6},{:.10}", v, ct.forward(v))?;
     }
@@ -568,6 +578,17 @@ fn cmd_export(
         p
     });
 
+    // Never write over the input — e.g. an FCS file named `foo.csv`, where
+    // set_extension("csv") is a no-op and the default output would clobber the source.
+    let same_as_input = out_path.as_path() == path
+        || matches!((out_path.canonicalize(), path.canonicalize()), (Ok(a), Ok(b)) if a == b);
+    if same_as_input {
+        anyhow::bail!(
+            "refusing to overwrite the input file {:?} — pass -o to choose a different output path",
+            path
+        );
+    }
+
     let mut wtr = csv::Writer::from_path(&out_path)
         .with_context(|| format!("cannot create {:?}", out_path))?;
 
@@ -579,7 +600,7 @@ fn cmd_export(
         let base = ev * n;
         let row: Vec<String> = events[base..base + n]
             .iter()
-            .map(|v| format!("{:.4}", v))
+            .map(|v| if v.is_finite() { format!("{:.4}", v) } else { "NA".to_string() })
             .collect();
         wtr.write_record(&row)?;
     }

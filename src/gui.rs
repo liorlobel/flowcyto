@@ -963,12 +963,16 @@ impl FlowCytoApp {
         let xs = fcs.parameters[xi].label.clone().filter(|l| !l.is_empty()).unwrap_or_else(|| short_chan(&xn));
         let ys = fcs.parameters[yi].label.clone().filter(|l| !l.is_empty()).unwrap_or_else(|| short_chan(&yn));
         const BIG: f64 = 1.0e12;
+        // Half-open split: the '-' side's upper edge is one ulp below the center so a
+        // point exactly on a center line belongs to the '+' side only (no double-count).
+        let cxm = cx.next_down();
+        let cym = cy.next_down();
         // (name, x_range, y_range): UR, UL, LL, LR
         let quads = [
             (format!("{}+ {}+", xs, ys), (cx, BIG), (cy, BIG)),
-            (format!("{}- {}+", xs, ys), (-BIG, cx), (cy, BIG)),
-            (format!("{}- {}-", xs, ys), (-BIG, cx), (-BIG, cy)),
-            (format!("{}+ {}-", xs, ys), (cx, BIG), (-BIG, cy)),
+            (format!("{}- {}+", xs, ys), (-BIG, cxm), (cy, BIG)),
+            (format!("{}- {}-", xs, ys), (-BIG, cxm), (-BIG, cym)),
+            (format!("{}+ {}-", xs, ys), (cx, BIG), (-BIG, cym)),
         ];
         let parent = self.new_gate_parent;
         let group = self.next_gate_id; // the first member's id doubles as the group id
@@ -2003,8 +2007,22 @@ impl FlowCytoApp {
         self.dark_mode = session.dark_mode;
         self.colormap = if session.viridis { ColorMap::Viridis } else { ColorMap::Jet };
         self.spill_override = session.spill_override;
+        // Validate a session-supplied override is square before any panel indexes it
+        // (every other override entry point validates; a hand-edited session might not).
+        if let Some(ov) = &self.spill_override {
+            let n = ov.channels.len();
+            if n == 0 || ov.rows.len() != n || ov.rows.iter().any(|r| r.len() != n) {
+                self.spill_override = None;
+            }
+        }
         self.gates = session.gates;
         self.next_gate_id = self.gates.iter().map(|g| g.id).max().unwrap_or(0) + 1;
+        // Reconcile gate-id-keyed UI state against the loaded gates so a stale id can't
+        // dangle (effective_mask of an unknown id returns all-true → wrong histogram).
+        if let Some(h) = self.hist_sample_pop { if !self.gates.iter().any(|g| g.id == h) { self.hist_sample_pop = None; } }
+        self.hist_hidden.retain(|id| self.gates.iter().any(|g| g.id == *id));
+        self.scatter_hidden.retain(|id| self.gates.iter().any(|g| g.id == *id));
+        self.bool_refs.retain(|id| self.gates.iter().any(|g| g.id == *id));
 
         // Activate the saved sample (loads its events, keeps the gate tree), then
         // override the transforms/axes with the saved ones (same files → same panel).
@@ -3140,9 +3158,13 @@ impl FlowCytoApp {
         };
         if self.pop_stats.is_none() {
             if let Some(fcs) = &self.fcs {
-                self.pop_stats = Some(population_stats(
-                    &self.compensated, &fcs.parameters, fcs.n_events, &self.gates, &stat_channels,
-                ));
+                // Match the buffer-length guard every other rebuild path uses, so a
+                // short `compensated` (e.g. mid-load) can't index out of bounds.
+                if self.compensated.len() >= fcs.n_events * fcs.n_params() {
+                    self.pop_stats = Some(population_stats(
+                        &self.compensated, &fcs.parameters, fcs.n_events, &self.gates, &stat_channels,
+                    ));
+                }
             }
         }
         let table = match &self.pop_stats { Some(t) => t, None => return };
@@ -3364,16 +3386,17 @@ impl FlowCytoApp {
     fn poll_batch(&mut self, ctx: &egui::Context) {
         if self.batch_rx.is_none() { return; }
         let mut msgs: Vec<BatchMsg> = Vec::new();
-        let mut finished = false;
+        let mut disconnected = false;
         if let Some(rx) = &self.batch_rx {
             loop {
                 match rx.try_recv() {
                     Ok(m) => msgs.push(m),
                     Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => { finished = true; break; }
+                    Err(TryRecvError::Disconnected) => { disconnected = true; break; }
                 }
             }
         }
+        let mut got_done = false;
         for m in msgs {
             match m {
                 BatchMsg::Progress { done, total, name } => {
@@ -3382,16 +3405,22 @@ impl FlowCytoApp {
                 }
                 BatchMsg::Table(g, s, t) => { if let Some(b) = &mut self.batch { b.tables.push((g, s, t)); } }
                 BatchMsg::Skip(s, r) => { if let Some(b) = &mut self.batch { b.skipped.push((s, r)); } }
-                BatchMsg::Done => { finished = true; }
+                BatchMsg::Done => { got_done = true; }
             }
         }
-        if finished {
+        // The worker sends Done on the normal path; a disconnect *without* a prior Done
+        // means it panicked mid-batch — surface that instead of reporting clean success.
+        if got_done || disconnected {
             let n = self.batch.as_ref().map(|b| b.tables.len()).unwrap_or(0);
             let ns = self.batch.as_ref().map(|b| b.skipped.len()).unwrap_or(0);
             self.batch_rx = None;
             self.batch_cancel = None;
             self.batch_progress = None;
-            self.status = format!("Batch done: {} processed, {} skipped", n, ns);
+            self.status = if got_done {
+                format!("Batch done: {} processed, {} skipped", n, ns)
+            } else {
+                format!("⚠ Batch ended early ({} processed, {} skipped) — a sample may have failed", n, ns)
+            };
         } else {
             ctx.request_repaint(); // keep ticking while the worker runs
         }
@@ -3615,7 +3644,10 @@ impl FlowCytoApp {
     }
 
     fn ui_samples(&mut self, ui: &mut egui::Ui) {
-        if self.samples.len() <= 1 {
+        // Show the panel for any non-empty workspace so the group-tag editor and Clear
+        // button are reachable even with a single sample (the switch/overlay controls
+        // simply have nothing to act on yet).
+        if self.samples.is_empty() {
             return;
         }
         let n_low = self.samples.iter().filter(|s| s.n_events.map(|n| n < QC_MIN_EVENTS).unwrap_or(false)).count();
@@ -4072,7 +4104,13 @@ fn load_recent() -> Vec<PathBuf> {
 fn shape_display_bbox(s: &GateShape) -> Option<(f64, f64, f64, f64)> {
     match s {
         GateShape::Rect { x_min, x_max, y_min, y_max } => Some((*x_min, *x_max, *y_min, *y_max)),
-        GateShape::Ellipse { cx, cy, rx, ry, .. } => Some((cx - rx, cx + rx, cy - ry, cy + ry)),
+        GateShape::Ellipse { cx, cy, rx, ry, angle } => {
+            // Half-extents of a rotated ellipse (axis-aligned box of the rotated shape).
+            let (s, c) = angle.sin_cos();
+            let hx = (rx * c).hypot(ry * s);
+            let hy = (rx * s).hypot(ry * c);
+            Some((cx - hx, cx + hx, cy - hy, cy + hy))
+        }
         GateShape::Polygon { vertices } => {
             if vertices.is_empty() { return None; }
             let (mut xmn, mut xmx, mut ymn, mut ymx) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);

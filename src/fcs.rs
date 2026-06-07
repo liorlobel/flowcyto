@@ -64,6 +64,7 @@ impl FcsFile {
     /// parsing the DATA segment. Used for per-tube QC in the Samples list.
     pub fn peek_events(path: &Path) -> Result<usize> {
         let file = File::open(path).with_context(|| format!("cannot open {:?}", path))?;
+        let file_len = file.metadata().map(|m| m.len() as usize).unwrap_or(usize::MAX);
         let mut rdr = BufReader::new(file);
         let mut header = [0u8; 58];
         rdr.read_exact(&mut header).context("header")?;
@@ -71,6 +72,9 @@ impl FcsFile {
         let text_end = parse_hdr_offset(&header[18..26])?;
         if text_end < text_start {
             bail!("corrupt header (TEXT end < start)");
+        }
+        if text_end >= file_len {
+            bail!("corrupt header (TEXT end beyond file size)");
         }
         rdr.seek(SeekFrom::Start(text_start as u64))?;
         let mut buf = vec![0u8; text_end - text_start + 1];
@@ -120,12 +124,13 @@ impl FcsFile {
 
         let mut kw = parse_text(&text_buf)?;
 
-        // Supplemental TEXT (FCS 3.1 §3.3)
+        // Supplemental TEXT (FCS 3.x): the standard keywords are $BEGINSTEXT/$ENDSTEXT
+        // (0/0 when absent, which is what this tool's own writer emits).
         if let (Some(ss), Some(se)) = (
-            kw.get("$SUPTEXT_START").and_then(|v| v.parse::<usize>().ok()),
-            kw.get("$SUPTEXT_END").and_then(|v| v.parse::<usize>().ok()),
+            kw.get("$BEGINSTEXT").and_then(|v| v.trim().parse::<usize>().ok()),
+            kw.get("$ENDSTEXT").and_then(|v| v.trim().parse::<usize>().ok()),
         ) {
-            if ss > 0 && se >= ss {
+            if ss > 0 && se >= ss && se < file_len {
                 rdr.seek(SeekFrom::Start(ss as u64))?;
                 let mut sup = vec![0u8; se - ss + 1];
                 if rdr.read_exact(&mut sup).is_ok() {
@@ -142,6 +147,9 @@ impl FcsFile {
         let n_params: usize = kw.get("$PAR")
             .context("$PAR keyword missing")?
             .trim().parse().context("$PAR is not an integer")?;
+        if n_params == 0 || n_params > 100_000 {
+            bail!("$PAR = {} is out of range (expected 1..=100000)", n_params);
+        }
 
         let n_events: usize = kw.get("$TOT")
             .context("$TOT keyword missing")?
@@ -186,14 +194,25 @@ impl FcsFile {
             .map(|s| s.trim().to_uppercase())
             .unwrap_or_else(|| "F".to_string());
 
-        // $BYTEORD: "1,2,3,4…" (ascending) = little-endian; "4,3,2,1" = big-endian.
-        let little_endian = kw.get("$BYTEORD")
-            .map(|s| {
+        // $BYTEORD: "1,2,3,4…" (ascending) = little-endian; "4,3,2,1" (descending) =
+        // big-endian. A genuine byte permutation (e.g. "2,1,4,3") is neither and would
+        // silently mis-decode, so reject it rather than guessing big-endian.
+        let little_endian = match kw.get("$BYTEORD") {
+            Some(s) => {
                 let parts: Vec<&str> = s.trim().split(',').collect();
-                // strictly ascending 1,2,3,… ⇒ little-endian (any byte width)
-                parts.iter().enumerate().all(|(i, p)| p.trim() == (i + 1).to_string())
-            })
-            .unwrap_or(true);
+                let w = parts.len();
+                let ascending = parts.iter().enumerate().all(|(i, p)| p.trim() == (i + 1).to_string());
+                let descending = parts.iter().enumerate().all(|(i, p)| p.trim() == (w - i).to_string());
+                if ascending {
+                    true
+                } else if descending {
+                    false
+                } else {
+                    bail!("unsupported $BYTEORD byte permutation: {:?}", s.trim());
+                }
+            }
+            None => true,
+        };
 
         if data_end < data_start {
             bail!("corrupt header: DATA end ({}) < start ({})", data_end, data_start);
@@ -283,7 +302,14 @@ fn parse_data(
     little_endian: bool,
     params: &[Parameter],
 ) -> Result<Vec<f64>> {
-    let total = n_params * n_events;
+    // Guard against a malformed header: the value count must not overflow, and can't
+    // exceed the DATA buffer (every datatype consumes ≥1 byte per value), so this bounds
+    // the allocation to the real file size instead of trusting $PAR/$TOT.
+    let total = n_params.checked_mul(n_events)
+        .context("$PAR × $TOT overflows usize")?;
+    if total > buf.len() {
+        bail!("$PAR × $TOT = {} values exceeds the {}-byte DATA segment", total, buf.len());
+    }
     let mut out = Vec::with_capacity(total);
     let mut c = Cursor::new(buf);
 
@@ -457,6 +483,22 @@ mod tests {
         assert!(parse_data(b"\0\0\0\0", 1, 1, "Z", true, &params).is_err());
     }
 
+    #[test]
+    fn parse_data_rejects_oversized_counts() {
+        // Audit M2: a huge $TOT with a small DATA buffer must error, not allocate ~GBs.
+        let params = [p(1, "A", 32, 0.0)];
+        let buf = f32le(&[1.0, 2.0]); // 8 bytes
+        assert!(parse_data(&buf, 1, 1_000_000_000, "F", true, &params).is_err());
+    }
+
+    #[test]
+    fn parse_data_rejects_overflowing_counts() {
+        // Audit M2: n_params * n_events that overflows usize must error, not wrap small.
+        let params = [p(1, "A", 32, 0.0)];
+        let buf = f32le(&[1.0]);
+        assert!(parse_data(&buf, usize::MAX, 2, "F", true, &params).is_err());
+    }
+
     // ── full file: build → open round-trip ─────────────────────────────────
 
     /// Assemble a complete FCS3.0 byte image (header + TEXT + DATA).
@@ -548,6 +590,30 @@ mod tests {
     #[test]
     fn open_rejects_non_fcs_magic() {
         let path = write_temp(b"NOTANFCSFILE........................................................", "magic");
+        assert!(FcsFile::open(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_rejects_byteord_permutation() {
+        // Audit L12c: a genuine byte permutation must error rather than silently mis-decode.
+        let data = f32le(&[1.0, 2.0, 3.0, 4.0]);
+        let mut kw = standard_kw();
+        for kv in kw.iter_mut() { if kv.0 == "$BYTEORD" { kv.1 = "2,1,4,3"; } }
+        let bytes = build_fcs(&kw, &data);
+        let path = write_temp(&bytes, "byteord");
+        assert!(FcsFile::open(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_rejects_huge_par() {
+        // Audit M2: an implausible $PAR must error before the parameter-loop allocation.
+        let data = f32le(&[1.0, 2.0]);
+        let mut kw = standard_kw();
+        for kv in kw.iter_mut() { if kv.0 == "$PAR" { kv.1 = "999999999"; } }
+        let bytes = build_fcs(&kw, &data);
+        let path = write_temp(&bytes, "hugepar");
         assert!(FcsFile::open(&path).is_err());
         let _ = std::fs::remove_file(&path);
     }

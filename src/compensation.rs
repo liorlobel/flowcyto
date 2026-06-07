@@ -22,7 +22,13 @@ pub fn parse_spillover(kw: &str) -> Result<(Vec<String>, Vec<Vec<f64>>)> {
     }
     let n: usize = parts[0].trim().parse()
         .context("spillover: first token (n) is not an integer")?;
-    let expected = 1 + n + n * n;
+    // Compute the expected token count with checked arithmetic: a crafted huge `n`
+    // would otherwise overflow `1 + n + n*n` (wrapping it small in release) and then
+    // slice out of bounds below.
+    let expected = n.checked_mul(n)
+        .and_then(|nn| nn.checked_add(n))
+        .and_then(|s| s.checked_add(1))
+        .context("spillover: n is implausibly large")?;
     if parts.len() < expected {
         bail!(
             "spillover has too few tokens: expected {}, got {} (n={})",
@@ -32,10 +38,19 @@ pub fn parse_spillover(kw: &str) -> Result<(Vec<String>, Vec<Vec<f64>>)> {
     let channels: Vec<String> = parts[1..=n]
         .iter().map(|s| s.trim().to_string()).collect();
 
+    // Parse strictly: a malformed token used to become 0.0 silently (corrupting the
+    // matrix), and "nan"/"inf" parse to non-finite — both poison compensation.
     let flat: Vec<f64> = parts[1 + n..1 + n + n * n]
         .iter()
-        .map(|s| s.trim().parse::<f64>().unwrap_or(0.0))
-        .collect();
+        .map(|s| {
+            let v: f64 = s.trim().parse()
+                .with_context(|| format!("spillover: '{}' is not a number", s.trim()))?;
+            if !v.is_finite() {
+                bail!("spillover contains a non-finite value '{}'", s.trim());
+            }
+            Ok(v)
+        })
+        .collect::<Result<_>>()?;
 
     let rows: Vec<Vec<f64>> = (0..n).map(|i| flat[i * n..(i + 1) * n].to_vec()).collect();
     Ok((channels, rows))
@@ -129,6 +144,11 @@ fn validate_square(channels: &[String], rows: &[Vec<f64>]) -> Result<()> {
     for (i, r) in rows.iter().enumerate() {
         if r.len() != n {
             bail!("row {} has {} values, expected {}", i, r.len(), n);
+        }
+        for (j, v) in r.iter().enumerate() {
+            if !v.is_finite() {
+                bail!("matrix entry [{},{}] is not finite ({})", i, j, v);
+            }
         }
     }
     Ok(())
@@ -286,9 +306,22 @@ impl SpilloverMatrix {
         if flat.len() != n * n {
             bail!("spillover matrix is not {n}×{n}");
         }
+        if !flat.iter().all(|v| v.is_finite()) {
+            bail!("spillover matrix contains non-finite (NaN/Inf) values");
+        }
         let m = DMatrix::from_row_slice(n, n, &flat);
         let inv = m.try_inverse()
             .context("spillover matrix is singular (cannot invert); check for linearly dependent channels")?;
+        // Reject ill-conditioned matrices: near-linearly-dependent channels (e.g. heavy
+        // tandem-dye overlap) invert to enormous entries that would silently explode
+        // compensated values. nalgebra only returns None at ~exact singularity, so a
+        // determinant of ~1e-13 inverts to ~1e13 with no error otherwise. A well-formed
+        // compensation inverse has small entries.
+        let max_inv = inv.iter().fold(0.0_f64, |mx, &x| mx.max(x.abs()));
+        if !max_inv.is_finite() || max_inv > 1.0e6 {
+            bail!("spillover matrix is ill-conditioned (inverse magnitude {:.3e}); \
+                   check for near-linearly-dependent channels", max_inv);
+        }
         Ok(SpilloverMatrix { channels, inv })
     }
 
@@ -444,6 +477,43 @@ mod tests {
         let chans = vec!["A".to_string(), "B".to_string()];
         let rows = vec![vec![1.0, 1.0], vec![1.0, 1.0]];
         assert!(SpilloverMatrix::from_parts(chans, &rows).is_err());
+    }
+
+    #[test]
+    fn parse_spillover_rejects_non_finite_value() {
+        // Audit M1b: "nan"/"inf" parse to non-finite and used to flow through silently.
+        assert!(parse_spillover("2,A,B,1,nan,0,1").is_err());
+        assert!(parse_spillover("2,A,B,1,inf,0,1").is_err());
+        assert!(parse_spillover("2,A,B,1,xyz,0,1").is_err()); // malformed → no longer 0.0
+    }
+
+    #[test]
+    fn parse_spillover_huge_n_errors_not_panics() {
+        // Audit M5: a crafted huge n must error cleanly, not overflow + slice-panic.
+        let kw = format!("{},A,B,1,0,0,1", usize::MAX);
+        assert!(parse_spillover(&kw).is_err());
+    }
+
+    #[test]
+    fn from_parts_rejects_non_finite() {
+        let chans = vec!["A".to_string(), "B".to_string()];
+        assert!(SpilloverMatrix::from_parts(chans, &[vec![1.0, f64::NAN], vec![0.0, 1.0]]).is_err());
+    }
+
+    #[test]
+    fn from_parts_rejects_near_singular() {
+        // Audit M1a: determinant ~1e-13 → inverse entries ~1e13 → must be rejected,
+        // not silently used (which would explode compensated values).
+        let chans = vec!["A".to_string(), "B".to_string()];
+        let rows = vec![vec![1.0, 1.0], vec![1.0, 1.0 + 1e-13]];
+        assert!(SpilloverMatrix::from_parts(chans, &rows).is_err());
+    }
+
+    #[test]
+    fn validate_square_rejects_non_finite() {
+        let chans = vec!["A".to_string(), "B".to_string()];
+        let rows = vec![vec![1.0, 0.0], vec![f64::INFINITY, 1.0]];
+        assert!(validate_square(&chans, &rows).is_err());
     }
 
     #[test]
