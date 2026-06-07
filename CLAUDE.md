@@ -1,7 +1,7 @@
 # flowcyto — developer guide & session handoff
 
 A Rust **CLI + GUI** for analyzing BD flow-cytometry **.fcs** files (FCS 2.0/3.0/3.1).
-Built incrementally and **validated against R/flowCore at every numeric layer**. ~5k LOC.
+Built incrementally and **validated against R/flowCore at every numeric layer**. ~6.5k LOC.
 
 ## Build & run  ⚠️ cargo is NOT on the normal PATH
 The `~/.cargo/bin/cargo` symlink is broken. Use one of:
@@ -13,7 +13,8 @@ cd /Users/liorlobel/flowcyto && /opt/homebrew/bin/rustup run stable cargo build 
 - GUI: `flowcyto gui <file.fcs>`  (or `flowcyto` with no args → GUI)
 - **macOS installer:** `./packaging/make-macos-app.sh` → `dist/flowcyto.app` + `dist/flowcyto-<version>.dmg` (drag-to-Applications). Builds host-arch (Apple Silicon), generates the `.icns` from `packaging/icon.png` (itself regenerable via `python3 packaging/make-icon.py` — a procedural viridis density-plot + gate-ring mark), writes Info.plist with the Cargo version, ad-hoc code-signs, and bundles an "Open Me First.txt" Gatekeeper guide into the DMG. Not notarized (needs paid Apple Developer Program) → recipients clear Gatekeeper once via `xattr -dr com.apple.quarantine /Applications/flowcyto.app` or "Open Anyway"; see `INSTALL.md`. `dist/` is git-ignored.
 - **Releasing:** bump `version` in `Cargo.toml`, commit, then push a `vX.Y.Z` tag. Two GitHub Actions workflows (`.github/workflows/macos-installer.yml`, `windows-installer.yml`) build on `macos-latest` (clippy+test gate → `.dmg`) and `windows-latest` (test → Inno Setup `.exe`) and attach both installers to the release (auto-created with `--generate-notes`; edit notes after if desired). Both also run on manual dispatch (artifact only). No need to build installers locally anymore.
-- Always finish with: `cargo build --release` clean, `cargo clippy --release --all-targets` = **0 warnings**, `cargo test --release` = **88 tests pass** (84 unit + 4 CLI integration). Unit tests live inline (`#[cfg(test)] mod tests`) in each module; `src/test_util.rs` is a `cfg(test)`-only in-memory `FcsFile` builder; `tests/cli.rs` drives the real binary against `tests/fixtures/tiny.fcs`. Add a regression test alongside any numeric change.
+- Always finish with: `cargo build --release` clean, `cargo clippy --release --all-targets` = **0 warnings**, `cargo test --release` = **90 tests pass** (86 unit + 4 CLI integration). Unit tests live inline (`#[cfg(test)] mod tests`) in each module; `src/test_util.rs` is a `cfg(test)`-only in-memory `FcsFile` builder; `tests/cli.rs` drives the real binary against `tests/fixtures/tiny.fcs`. Add a regression test alongside any numeric change.
+- Current released version: **0.1.6** (latest GitHub release; macOS `.dmg` + Windows `.exe`, unsigned).
 
 ## Architecture (src/)
 | file | role |
@@ -23,15 +24,15 @@ cd /Users/liorlobel/flowcyto && /opt/homebrew/bin/rustup run stable cargo build 
 | `compensation.rs` | spillover: parse / apply (M⁻¹) / `compute_spillover` from single stains / matrix CSV·JSON IO |
 | `transform.rs` | `AxisTransform` (Linear/Log/Asinh/Logicle) + `CompiledTransform` (forward/inverse) |
 | `logicle.rs` | Moore & Parks logicle (faithful port; `scale`/`inverse`) |
-| `gating.rs` | `Gate` + `GateShape` (Rect/Ellipse/Polygon/Range), hierarchical `effective_mask`, `gate_tree_order` |
+| `gating.rs` | `Gate` + `GateShape` (Rect/Ellipse/Polygon/Range/**Boolean**), hierarchical `effective_mask`, `gate_tree_order`, **`compute_own_masks`** (the one place that builds every gate's own mask — geometric gates then Boolean AND/OR/NOT combos in dependency order; all views + CLI go through it) |
 | `popstats.rs` | **pure** per-population stats engine (count/%parent/%total/median-MFI/mean/CV) — also the batch engine |
 | `stats.rs` | per-channel whole-file stats (CLI `stats`) |
-| `gui.rs` | egui GUI (2.6k LOC) — tabs Plot/Histogram/Stats/Batch/Spillover |
+| `gui.rs` | egui GUI (~4.5k LOC) — tabs Plot/Histogram/Stats/Batch/Spillover; native macOS menu bar via `muda` (cfg-gated) |
 | `main.rs` | clap CLI |
 
 **CLI:** `info stats export gate popstats spillover compute-spillover rewrite-spillover transform-dump gui`
 
-**GUI:** left panel = Samples (QC event counts, 👁 overlay) · Channels (X/Y + per-axis transform) · Axis limits · Gates (draw ▭⬭⬠ ✛Quad ✎Edit, tree, ▶ gate-from-here, numeric inspector, save/load). Tabs: Plot (density + contours + gates + control overlay + backgate), Histogram (overlays: populations or samples), Stats (per-population table + CSV), Batch (streamed multi-sample → CSV), Spillover (view/edit/compute/write matrix).
+**GUI:** left panel = Samples (QC counts, 👁 overlay, **group/condition tags**) · Channels (X/Y + per-axis scale, "apply X scale to all fluorescence") · Axis limits · Gates. Toolbar: Open/**Recent**/**Save+Load session**/Compensate/theme/tabs. Gating: draw ▭⬭⬠ ✛Quad ✎Edit (drag body to move, rotate ellipse), **double-click a gate to drill in**, per-gate **👁 hide** + **⊕ zoom-to-gate**, **➕ Boolean (AND/OR/NOT)** builder, **undo/redo**, numeric inspector, save/load JSON, **export a population → .fcs**. Tabs: Plot (density dots or **filled heatmap "Fill"**, contours, gates, control overlay, backgate, **🔒 Lock view** = frozen pan/zoom, **adjustable Single / cols×rows grid up to 6×6**, Viridis/Jet colormap, **📷 Save plot PNG**, inline ⚖ compensation preview), Histogram (overlays + interval gates), Stats (table + CSV + **📋 Copy TSV**), Batch (threaded multi-sample → CSV + **📋 Copy** + **📊 chart across samples**), Spillover (view/edit/compute/write matrix). **Drag-and-drop .fcs** to open; keyboard shortcuts (R/E/P/Q/G/V/Esc, ⌘Z/⌘S/⌘1–5) + ⌘+/− UI zoom.
 
 ## Validation discipline (THE most important habit — keep it)
 R + **flowCore 2.24.0** are installed; flowCore is the oracle. Validate every numeric change before building on it:
@@ -46,8 +47,8 @@ R + **flowCore 2.24.0** are installed; flowCore is the oracle. Validate every nu
 - Caches (`scatter`/`pop_stats`/`hist_cache`/`ref_scatter`/`gate_counts`) invalidate via `None` + `needs_reprocess/regate/rescatter`. There was a frame-ordering class of bug — keep `compensated` consistent with `fcs` before any panel renders.
 
 ## Status — feature roadmap
-FlowJo-parity: ✅ per-population stats · 1D histograms+overlays · multi-sample batch. UI bundles: ✅ A (quadrant + numeric + drag-resize gates), ✅ B (%/count labels, gate-from-here, backgating), ✅ C (control overlay + per-tube QC), ◑ D (✅ contours+legend; **TODO: multi-plot layout grid**, zebra plots).
-Other possible: boolean gates, subset-FCS export, per-tube %viable QC scan (needs a Live gate), tSNE/UMAP/FlowSOM.
+FlowJo-parity ✅: per-population stats · 1D histograms+overlays · multi-sample batch · quadrant/numeric/drag-resize/rotate gates · %/count labels · gate-from-here + double-click drill · backgating · control overlay + per-tube QC · contours+legend · **multi-plot grid (up to 6×6)** · **boolean (AND/OR/NOT) gates** · **subset-FCS export** · filled-density heatmap · undo/redo · sessions · clipboard/recent/drag-drop · native menu bar · cross-platform CI installers (macOS + Windows).
+Still open / ideas: per-tube %viable QC scan (needs a Live gate), zebra plots, code-signing+notarization (needs paid Apple + Windows certs), universal/Intel macOS build, tSNE/UMAP/FlowSOM.
 
 ## The real analysis done with it (cDC in cAPC/SAA-diet experiments)
 Data: `…/cAPC_SAA_Diets/*_cAPC_mice_myeloid_stain/` (4 usable experiments; 02_12_19 excluded — no controls). Panel: FITC=CD11c, PE=CD103, PerCP-Cy5-5=CD11b, PE-Cy7=MHCII, PacBlue=CD45, AmCyan=Live/Dead. cDC = CD11c⁺MHCII⁺; cDC1 = CD103⁺CD11b⁻; cDC2 = CD103⁻CD11b⁺.
