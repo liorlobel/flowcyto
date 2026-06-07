@@ -7,7 +7,7 @@ use std::sync::Arc;
 use egui::{Color32, RichText, Stroke};
 use egui_extras::{Column, TableBuilder};
 use egui_plot::{
-    GridMark, Legend, Line, Plot, PlotBounds, PlotPoint, PlotPoints, Points,
+    GridMark, Legend, Line, Plot, PlotBounds, PlotImage, PlotPoint, PlotPoints, Points,
     Polygon as PlotPolygon, Text as PlotText,
 };
 
@@ -58,6 +58,11 @@ impl ColorMap {
 
 fn density_color(bucket: usize, n: usize, dark: bool, cmap: ColorMap) -> Color32 {
     let t = bucket as f32 / (n.saturating_sub(1).max(1)) as f32;
+    density_color_t(t, dark, cmap)
+}
+
+/// Colormap lookup for a continuous density value t ∈ [0,1] (used by the filled heatmap).
+fn density_color_t(t: f32, dark: bool, cmap: ColorMap) -> Color32 {
     match cmap {
         ColorMap::Jet => jet_color(t, dark),
         ColorMap::Viridis => viridis_color(t),
@@ -140,6 +145,15 @@ enum DrawMode { Navigate, Rect, Ellipse, Polygon, Quadrant, Edit }
 #[derive(PartialEq, Clone, Copy)]
 enum ActiveTab { Plot, Histogram, Stats, Batch, Spillover }
 
+#[derive(PartialEq, Clone, Copy)]
+enum BatchMetric { PctParent, PctTotal, Mfi }
+
+impl BatchMetric {
+    fn label(self) -> &'static str {
+        match self { BatchMetric::PctParent => "% parent", BatchMetric::PctTotal => "% total", BatchMetric::Mfi => "MFI" }
+    }
+}
+
 /// Cached density buckets for one cell of the 2×2 grid view.
 struct GridCell {
     xi: usize,
@@ -160,6 +174,15 @@ struct ScatterCache {
     pop: Option<u32>, // active population the plot is restricted to (gate-from-here)
     back_pts: Vec<[f64; 2]>, // parent population events (greyed) when backgating
     contours: Vec<[[f64; 2]; 2]>, // iso-density contour line segments (display coords)
+    heat: Option<HeatGrid>, // density grid for the filled-heatmap render mode
+}
+
+/// Per-bin normalized density (sqrt-scaled, 0 = empty) for the filled heatmap,
+/// with the display-coord extent it spans.
+struct HeatGrid {
+    t: Vec<f32>,      // len n*n, index = by*n + bx
+    n: usize,
+    extent: [f64; 4], // [xmin, xmax, ymin, ymax] in display coords
 }
 
 /// A user-supplied / edited spillover matrix that overrides the embedded one.
@@ -252,11 +275,15 @@ pub struct FlowCytoApp {
     file_path: Option<PathBuf>,
     compensated: Vec<f64>,           // active sample: raw → optional compensate (DATA space)
 
+    recent_files: Vec<PathBuf>,      // recently opened FCS paths (most-recent first)
+
     // Workspace of samples (active one is loaded into `fcs`/`compensated`).
     samples: Vec<SampleRef>,
     active_sample: usize,
     batch: Option<BatchResult>,
     batch_channel: usize,            // channel index whose MFI shows in the batch table
+    batch_plot_pop: Option<u32>,     // population charted across samples in the Batch tab (None = none)
+    batch_plot_metric: BatchMetric,  // which stat the batch chart shows
     batch_rx: Option<Receiver<BatchMsg>>,        // streamed results from the worker thread
     batch_cancel: Option<Arc<AtomicBool>>,       // set to stop the worker early
     batch_progress: Option<(usize, usize)>,      // (done, total) while a batch runs
@@ -310,7 +337,10 @@ pub struct FlowCytoApp {
     active_pop: Option<u32>,      // "gate from here": plot restricted to this population's events
     backgate: bool,               // show the active population's PARENT events greyed behind it
     show_contours: bool,          // overlay iso-density contour lines (Plot tab)
+    density_fill: bool,           // render a filled density heatmap instead of dots
     lock_view: bool,              // freeze plot pan/zoom so the view holds still while gating
+    fit_view: bool,              // one-shot: reframe the next plot to the data extent
+    scatter_hidden: std::collections::HashSet<u32>, // gate ids hidden on the scatter overlay
     grab_handle: Option<usize>,   // which handle of the selected gate is being dragged (Edit mode)
     gate_move_last: Option<[f64; 2]>, // last cursor pos (gate-display coords) while dragging a gate body
 
@@ -341,7 +371,9 @@ impl Default for FlowCytoApp {
     fn default() -> Self {
         FlowCytoApp {
             fcs: None, file_path: None, compensated: Vec::new(),
+            recent_files: Vec::new(),
             samples: Vec::new(), active_sample: 0, batch: None, batch_channel: 0,
+            batch_plot_pop: None, batch_plot_metric: BatchMetric::PctParent,
             batch_rx: None, batch_cancel: None, batch_progress: None,
             ref_sample: None, ref_scatter: None,
             do_compensate: false, dark_mode: true,
@@ -370,7 +402,10 @@ impl Default for FlowCytoApp {
             active_pop: None,
             backgate: false,
             show_contours: false,
+            density_fill: false,
             lock_view: true,
+            fit_view: false,
+            scatter_hidden: std::collections::HashSet::new(),
             grab_handle: None,
             gate_move_last: None,
             pop_stats: None,
@@ -402,6 +437,7 @@ impl FlowCytoApp {
     /// Add files to the workspace. If the workspace was empty, the first becomes
     /// active with a fresh panel setup; otherwise they are appended (analysis kept).
     pub fn add_files(&mut self, paths: Vec<PathBuf>) {
+        self.push_recent(&paths);
         let was_empty = self.samples.is_empty();
         for p in paths {
             let name = p.file_stem().map(|s| s.to_string_lossy().to_string())
@@ -414,6 +450,25 @@ impl FlowCytoApp {
             self.activate_sample(0, true);
         } else {
             self.status = format!("{} samples in workspace", self.samples.len());
+        }
+    }
+
+    /// Record opened files at the front of the recent list (deduped, capped) and
+    /// persist them.
+    fn push_recent(&mut self, paths: &[PathBuf]) {
+        for p in paths {
+            self.recent_files.retain(|x| x != p);
+            self.recent_files.insert(0, p.clone());
+        }
+        self.recent_files.truncate(12);
+        self.save_recent();
+    }
+
+    fn save_recent(&self) {
+        if let Some(store) = recent_store_path() {
+            if let Some(dir) = store.parent() { let _ = std::fs::create_dir_all(dir); }
+            let list: Vec<String> = self.recent_files.iter().map(|p| p.to_string_lossy().to_string()).collect();
+            if let Ok(j) = serde_json::to_string_pretty(&list) { let _ = std::fs::write(&store, j); }
         }
     }
 
@@ -521,6 +576,7 @@ impl FlowCytoApp {
 
         let mut buckets: Vec<Vec<[f64; 2]>> = vec![Vec::new(); N_BUCKETS];
         let mut contours: Vec<[[f64; 2]; 2]> = Vec::new();
+        let mut heat: Option<HeatGrid> = None;
         if nk > 0 {
             let (xmin, xmax) = data_range(&dx);
             let (ymin, ymax) = data_range(&dy);
@@ -541,6 +597,15 @@ impl FlowCytoApp {
                     .iter().map(|f| f * max_d as f64).collect();
                 contours = contour_segments(&hist, DENSITY_BINS, xmin, xmax, ymin, ymax, &levels);
             }
+            // Normalized density grid for the filled-heatmap mode.
+            let mut t = vec![0.0f32; DENSITY_BINS * DENSITY_BINS];
+            for bx in 0..DENSITY_BINS {
+                for by in 0..DENSITY_BINS {
+                    let c = hist[bx][by];
+                    if c > 0 { t[by * DENSITY_BINS + bx] = ((c as f64 / max_d as f64).sqrt()) as f32; }
+                }
+            }
+            heat = Some(HeatGrid { t, n: DENSITY_BINS, extent: [xmin, xmax, ymin, ymax] });
         }
 
         // Backgating: parent population's events (greyed) for context behind the child.
@@ -563,6 +628,7 @@ impl FlowCytoApp {
             pop: self.active_pop,
             back_pts,
             contours,
+            heat,
         });
     }
 
@@ -614,6 +680,73 @@ impl FlowCytoApp {
             }
         }
         best.map(|(id, _)| id)
+    }
+
+    /// Write the events in a population to a new FCS file (raw events + the sample's
+    /// spillover, so it can be re-compensated downstream).
+    fn export_gated_fcs(&mut self, gid: u32) {
+        let mask = self.pop_mask(gid);
+        let (subset, gname) = {
+            let fcs = match &self.fcs { Some(f) => f, None => return };
+            let n = fcs.n_params();
+            let mut sub: Vec<f64> = Vec::new();
+            let mut count = 0usize;
+            for e in 0..fcs.n_events {
+                if mask.get(e).copied().unwrap_or(false) {
+                    sub.extend_from_slice(&fcs.events[e * n..(e + 1) * n]);
+                    count += 1;
+                }
+            }
+            if count == 0 { self.status = "That population has 0 events — nothing to export.".into(); return; }
+            let subset = FcsFile {
+                version: fcs.version.clone(),
+                keywords: fcs.keywords.clone(),
+                parameters: fcs.parameters.clone(),
+                n_events: count,
+                events: sub,
+            };
+            let gname = self.gates.iter().find(|g| g.id == gid).map(|g| g.name.clone()).unwrap_or_else(|| "gated".into());
+            (subset, gname)
+        };
+        let default = self.file_path.as_ref().and_then(|p| p.file_stem())
+            .map(|s| format!("{}_{}.fcs", s.to_string_lossy(), sanitize(&gname)))
+            .unwrap_or_else(|| "gated.fcs".into());
+        if let Some(path) = rfd::FileDialog::new().add_filter("FCS", &["fcs"]).set_file_name(default).save_file() {
+            self.status = match fcs_write::write_fcs(&subset, None, &path) {
+                Ok(_) => format!("Exported {} events ({}) → {}", subset.n_events, gname, path.display()),
+                Err(e) => format!("Export error: {}", e),
+            };
+        }
+    }
+
+    /// Frame the plot on a gate: switch X/Y to the gate's channels and set manual
+    /// axis limits to its extent (+margin), in data units.
+    fn zoom_to_gate(&mut self, gid: u32) {
+        let g = match self.gates.iter().find(|g| g.id == gid) { Some(g) => g.clone(), None => return };
+        let bbox = match shape_display_bbox(&g.shape) {
+            Some(b) => b,
+            None => { self.status = "Interval gates have no 2-D extent to zoom to.".into(); return; }
+        };
+        let (xi, yi) = match &self.fcs {
+            Some(f) => match (f.param_index(&g.x_channel), f.param_index(&g.y_channel)) {
+                (Some(a), Some(b)) => (a, b),
+                _ => { self.status = "Gate channels not in this sample.".into(); return; }
+            },
+            None => return,
+        };
+        let (dxmin, dxmax, dymin, dymax) = bbox;
+        let xt = g.x_transform.compile();
+        let yt = g.y_transform.compile();
+        let mx = (dxmax - dxmin).abs().max(1e-9) * 0.15;
+        let my = (dymax - dymin).abs().max(1e-9) * 0.15;
+        let (x0, x1) = (xt.inverse(dxmin - mx), xt.inverse(dxmax + mx));
+        let (y0, y1) = (yt.inverse(dymin - my), yt.inverse(dymax + my));
+        self.x_ch = xi; self.y_ch = yi;
+        self.x_lo = x0.min(x1); self.x_hi = x0.max(x1); self.x_manual = true;
+        self.y_lo = y0.min(y1); self.y_hi = y0.max(y1); self.y_manual = true;
+        self.scatter = None;
+        self.needs_rescatter = true;
+        self.status = format!("Zoomed to “{}”", g.name);
     }
 
     /// Drill into the gate under a double-clicked point ("gate from here"). Returns
@@ -1040,7 +1173,8 @@ impl eframe::App for FlowCytoApp {
         }
 
         #[cfg(target_os = "macos")]
-        self.handle_menu_events();
+        self.handle_menu_events(ctx);
+        self.handle_dropped_files(ctx);
         self.poll_batch(ctx);
         self.handle_keys(ctx);
 
@@ -1056,6 +1190,25 @@ impl eframe::App for FlowCytoApp {
 // ── UI panels ─────────────────────────────────────────────────────────────
 
 impl FlowCytoApp {
+    /// Open .fcs files dropped onto the window; show a hint while hovering.
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        if hovering {
+            egui::Area::new(egui::Id::new("drop_hint")).fixed_pos(egui::pos2(20.0, 40.0)).show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.label(RichText::new("⤓ Drop .fcs files to open").size(16.0));
+                });
+            });
+        }
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw.dropped_files.iter()
+                .filter_map(|f| f.path.clone())
+                .filter(|p| p.extension().map(|e| e.eq_ignore_ascii_case("fcs")).unwrap_or(false))
+                .collect()
+        });
+        if !dropped.is_empty() { self.add_files(dropped); }
+    }
+
     /// Keyboard shortcuts. Skipped while a text field has focus so typing names
     /// or numbers is never hijacked.
     fn handle_keys(&mut self, ctx: &egui::Context) {
@@ -1117,8 +1270,8 @@ impl FlowCytoApp {
     /// Dispatch native-menu clicks. Actions mirror the toolbar/keyboard exactly,
     /// so the menu never diverges from the in-app controls.
     #[cfg(target_os = "macos")]
-    fn handle_menu_events(&mut self) {
-        enum A { Open, SaveGates, SaveSession, LoadSession, SavePlot, Undo, Redo, Theme, Tab(usize) }
+    fn handle_menu_events(&mut self, ctx: &egui::Context) {
+        enum A { Open, SaveGates, SaveSession, LoadSession, SavePlot, Undo, Redo, Theme, Tab(usize), ZoomIn, ZoomOut, ZoomReset }
         let mut acts: Vec<A> = Vec::new();
         if let Some(st) = &self.menu {
             while let Ok(ev) = muda::MenuEvent::receiver().try_recv() {
@@ -1131,6 +1284,9 @@ impl FlowCytoApp {
                 else if id == st.undo { acts.push(A::Undo); }
                 else if id == st.redo { acts.push(A::Redo); }
                 else if id == st.theme { acts.push(A::Theme); }
+                else if id == st.zoom_in { acts.push(A::ZoomIn); }
+                else if id == st.zoom_out { acts.push(A::ZoomOut); }
+                else if id == st.zoom_reset { acts.push(A::ZoomReset); }
                 else if let Some(i) = st.tabs.iter().position(|t| *t == id) { acts.push(A::Tab(i)); }
             }
         }
@@ -1148,6 +1304,9 @@ impl FlowCytoApp {
                 A::Undo => self.undo(),
                 A::Redo => self.redo(),
                 A::Theme => { self.dark_mode = !self.dark_mode; self.needs_rescatter = true; }
+                A::ZoomIn => ctx.set_zoom_factor((ctx.zoom_factor() * 1.1).min(3.0)),
+                A::ZoomOut => ctx.set_zoom_factor((ctx.zoom_factor() / 1.1).max(0.5)),
+                A::ZoomReset => ctx.set_zoom_factor(1.0),
                 A::Tab(i) => self.active_tab = TABS[i],
             }
         }
@@ -1162,6 +1321,27 @@ impl FlowCytoApp {
                     {
                         self.add_files(paths);
                     }
+                }
+                // Recent files
+                {
+                    let recent = self.recent_files.clone();
+                    let mut pick: Option<PathBuf> = None;
+                    let mut clear = false;
+                    ui.menu_button("🕘 Recent", |ui| {
+                        if recent.is_empty() { ui.label(RichText::new("(none)").weak()); }
+                        for p in &recent {
+                            let name = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                            if ui.button(name).on_hover_text(p.to_string_lossy()).clicked() {
+                                pick = Some(p.clone()); ui.close_menu();
+                            }
+                        }
+                        if !recent.is_empty() {
+                            ui.separator();
+                            if ui.button("Clear recent").clicked() { clear = true; ui.close_menu(); }
+                        }
+                    });
+                    if clear { self.recent_files.clear(); self.save_recent(); }
+                    if let Some(p) = pick { self.add_files(vec![p]); }
                 }
                 if ui.button("🖫 Save session").on_hover_text("Save workspace + gates + transforms + compensation").clicked() {
                     self.save_session();
@@ -1444,6 +1624,8 @@ impl FlowCytoApp {
         let order = crate::gating::gate_tree_order(&self.gates);
         let mut to_delete: Option<u32> = None;
         let mut reparent: Option<(u32, Option<u32>)> = None;
+        let mut zoom_to: Option<u32> = None;
+        let mut export_gid: Option<u32> = None;
         for (gid, depth) in order {
             let idx = match self.gates.iter().position(|g| g.id == gid) { Some(i) => i, None => continue };
             let (color, _) = gate_color(gid);
@@ -1467,6 +1649,13 @@ impl FlowCytoApp {
                 if ui.small_button("▶").on_hover_text("gate from here (plot only this population)").clicked() {
                     self.active_pop = Some(gid); self.new_gate_parent = Some(gid); self.scatter = None;
                 }
+                let hidden = self.scatter_hidden.contains(&gid);
+                if ui.small_button(if hidden { "🚫" } else { "👁" })
+                    .on_hover_text("show / hide this gate's outline on the plot").clicked()
+                {
+                    if hidden { self.scatter_hidden.remove(&gid); } else { self.scatter_hidden.insert(gid); }
+                }
+                if ui.small_button("⊕").on_hover_text("zoom the plot to this gate").clicked() { zoom_to = Some(gid); }
                 if ui.small_button("🗑").clicked() { to_delete = Some(gid); }
             });
             ui.horizontal(|ui| {
@@ -1579,10 +1768,18 @@ impl FlowCytoApp {
                     if started { self.push_undo_state(before); }
                     if changed { self.needs_regate = true; }
                 }
+                ui.horizontal(|ui| {
+                    ui.add_space(ind);
+                    if ui.button("💾 Export events → .fcs")
+                        .on_hover_text("Write this population's events to a new FCS file").clicked()
+                    { export_gid = Some(gid); }
+                });
             }
             ui.separator();
         }
 
+        if let Some(gid) = zoom_to { self.zoom_to_gate(gid); }
+        if let Some(gid) = export_gid { self.export_gated_fcs(gid); }
         if let Some(gid) = to_delete {
             self.push_undo();
             // Re-parent children of the deleted gate to its parent (avoid orphans).
@@ -1920,7 +2117,8 @@ impl FlowCytoApp {
         // gates on this channel pair (outline + label), remapped to current transforms
         let gate_draws: Vec<(u32, String, GateShape, CompiledTransform, CompiledTransform)> =
             self.gates.iter().filter_map(|g| {
-                if g.x_channel.eq_ignore_ascii_case(&x_name_base(&x_name))
+                if !self.scatter_hidden.contains(&g.id)
+                    && g.x_channel.eq_ignore_ascii_case(&x_name_base(&x_name))
                     && g.y_channel.eq_ignore_ascii_case(&x_name_base(&y_name))
                 {
                     Some((g.id, g.name.clone(), g.shape.clone(), g.x_transform.compile(), g.y_transform.compile()))
@@ -2237,11 +2435,17 @@ impl FlowCytoApp {
             ui.separator();
             if !self.grid_mode {
                 if ui.checkbox(&mut self.show_contours, "Contours").changed() { self.scatter = None; }
-                ui.label(RichText::new("iso-density lines").small().color(Color32::GRAY));
+                ui.checkbox(&mut self.density_fill, "Fill")
+                    .on_hover_text("Filled density heatmap instead of dots");
                 ui.separator();
             }
             ui.checkbox(&mut self.lock_view, "🔒 Lock view")
                 .on_hover_text("Freeze pan/zoom so the plot holds still while gating (uncheck to drag-pan / pinch-zoom)");
+            if !self.grid_mode && !self.lock_view
+                && ui.button("⤢ Fit").on_hover_text("Reset zoom to fit all data").clicked()
+            {
+                self.x_manual = false; self.y_manual = false; self.fit_view = true; self.scatter = None;
+            }
             ui.separator();
             ui.label("Colormap:");
             egui::ComboBox::from_id_salt("cmap").selected_text(self.colormap.label()).show_ui(ui, |ui| {
@@ -2300,10 +2504,32 @@ impl FlowCytoApp {
         let back_pts: Vec<[f64; 2]> = self.scatter.as_ref().map(|s| s.back_pts.clone()).unwrap_or_default();
         let contours: Vec<[[f64; 2]; 2]> = self.scatter.as_ref().map(|s| s.contours.clone()).unwrap_or_default();
 
+        // Filled-density heatmap: build a texture from the cached density grid.
+        let heat_image: Option<(egui::TextureHandle, PlotPoint, egui::Vec2)> = if self.density_fill {
+            self.scatter.as_ref().and_then(|s| s.heat.as_ref()).map(|h| {
+                let n = h.n;
+                let mut px = vec![Color32::TRANSPARENT; n * n];
+                for r in 0..n {            // image row 0 = top = highest-y bin
+                    let by = n - 1 - r;
+                    for c in 0..n {
+                        let t = h.t[by * n + c];
+                        if t > 0.0 { px[r * n + c] = density_color_t(t, dark, cmap); }
+                    }
+                }
+                let img = egui::ColorImage { size: [n, n], pixels: px };
+                let tex = ui.ctx().load_texture("density_heat", img, egui::TextureOptions::LINEAR);
+                let [x0, x1, y0, y1] = h.extent;
+                let center = PlotPoint::new((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+                let size = egui::vec2((x1 - x0) as f32, (y1 - y0) as f32);
+                (tex, center, size)
+            })
+        } else { None };
+
         // Gate render data for the CURRENT channel pair (any transform — remap below).
         let gate_draws: Vec<(u32, String, GateShape, CompiledTransform, CompiledTransform)> =
             self.gates.iter().filter_map(|g| {
-                if g.x_channel.eq_ignore_ascii_case(&x_name_base(&x_name))
+                if !self.scatter_hidden.contains(&g.id)
+                    && g.x_channel.eq_ignore_ascii_case(&x_name_base(&x_name))
                     && g.y_channel.eq_ignore_ascii_case(&x_name_base(&y_name))
                 {
                     // label = name + "%parent (count)" from the gate-count cache
@@ -2331,15 +2557,21 @@ impl FlowCytoApp {
                 Some(PlotBounds::from_min_max([xlo, ylo], [xhi, yhi]))
             } else { None }
         };
-        // Locked view: freeze bounds to the data extent (+margin) so the plot can't
-        // auto-fit/drift as the rubber-band, gates, or cursor preview change.
-        let view_bounds = manual_bounds.or_else(|| {
-            if !self.lock_view { return None; }
+        // "Fit" reframes once to the data extent (one-shot); locked view freezes
+        // bounds to the data extent (+margin) so the plot can't auto-fit/drift as the
+        // rubber-band, gates, or cursor preview change.
+        let data_extent = || {
             let (dxr, dyr) = scatter_display_range(&buckets);
             let mx = (dxr.1 - dxr.0).abs().max(1e-9) * 0.05;
             let my = (dyr.1 - dyr.0).abs().max(1e-9) * 0.05;
-            Some(PlotBounds::from_min_max([dxr.0 - mx, dyr.0 - my], [dxr.1 + mx, dyr.1 + my]))
-        });
+            PlotBounds::from_min_max([dxr.0 - mx, dyr.0 - my], [dxr.1 + mx, dyr.1 + my])
+        };
+        let view_bounds = if self.fit_view {
+            self.fit_view = false; // consume the one-shot
+            Some(data_extent())
+        } else {
+            manual_bounds.or_else(|| if self.lock_view { Some(data_extent()) } else { None })
+        };
 
         // Clamp box for gate outlines so open/±∞ bounds (e.g. quadrant gates) don't
         // blow up the plot's auto-fit. Gate *membership* still uses the real bounds.
@@ -2441,11 +2673,15 @@ impl FlowCytoApp {
                     .name(format!("ref: {}", ref_name)));
             }
 
-            // density scatter
-            for (k, pts) in buckets.iter().enumerate() {
-                if pts.is_empty() { continue; }
-                pu.points(Points::new(PlotPoints::new(pts.clone()))
-                    .radius(1.4).color(density_color(k, N_BUCKETS, dark, cmap)));
+            // density: filled heatmap, or sampled dots
+            if let Some((tex, center, size)) = &heat_image {
+                pu.image(PlotImage::new(tex.id(), *center, *size));
+            } else {
+                for (k, pts) in buckets.iter().enumerate() {
+                    if pts.is_empty() { continue; }
+                    pu.points(Points::new(PlotPoints::new(pts.clone()))
+                        .radius(1.4).color(density_color(k, N_BUCKETS, dark, cmap)));
+                }
             }
 
             // iso-density contour lines (on top of the dots)
@@ -2872,11 +3108,25 @@ impl FlowCytoApp {
                 .small().color(Color32::GRAY));
         });
         let mut do_export = false;
+        let mut do_copy = false;
         ui.horizontal(|ui| {
             if ui.button("💾 Export CSV (tidy)").clicked() { do_export = true; }
+            if ui.button("📋 Copy (TSV)").on_hover_text("Copy the table as tab-separated text (paste into R/Excel)").clicked() { do_copy = true; }
             ui.label(RichText::new(format!("{} populations × {} channels", table.rows.len(), table.channels.len()))
                 .small().color(Color32::GRAY));
         });
+        if do_copy {
+            let mut s = String::from("Population\tCount\t%Parent\t%Total");
+            for ch in &table.channels { s.push_str(&format!("\tMFI {}", ch)); }
+            s.push('\n');
+            for r in &table.rows {
+                s.push_str(&format!("{}\t{}\t{:.2}\t{:.2}", r.name, r.count, r.pct_parent, r.pct_total));
+                for m in &r.medians { s.push_str(&format!("\t{}", fmt(*m))); }
+                s.push('\n');
+            }
+            ui.output_mut(|o| o.copied_text = s);
+            self.status = "Copied population stats to clipboard (TSV).".into();
+        }
         ui.separator();
 
         egui::ScrollArea::both().show(ui, |ui| {
@@ -3122,6 +3372,7 @@ impl FlowCytoApp {
     fn batch_view(&mut self, ui: &mut egui::Ui) {
         let mut do_run = false;
         let mut do_export = false;
+        let mut do_copy = false;
         let mut do_cancel = false;
         let running = self.batch_rx.is_some();
         ui.horizontal(|ui| {
@@ -3129,6 +3380,7 @@ impl FlowCytoApp {
             if ui.add_enabled(!running, egui::Button::new("▶ Run over all samples")).clicked() { do_run = true; }
             if running && ui.button("✖ Cancel").clicked() { do_cancel = true; }
             if self.batch.is_some() && !running && ui.button("💾 Export combined CSV").clicked() { do_export = true; }
+            if self.batch.is_some() && !running && ui.button("📋 Copy (TSV)").on_hover_text("Copy the visible table as tab-separated text").clicked() { do_copy = true; }
         });
         ui.label(RichText::new(format!(
             "{} samples · {} gates · streamed on a worker thread (UI stays responsive)", self.samples.len(), self.gates.len()
@@ -3178,6 +3430,17 @@ impl FlowCytoApp {
         } else {
             let ci = self.batch_channel.min(channels.len() - 1);
             let sel_name = channels[ci].clone();
+            if do_copy {
+                let mut s = format!("Group\tSample\tPopulation\tCount\t%Parent\t%Total\tMFI {}\n", sel_name);
+                for (group, sample, name, depth, count, pp, pt, medians, ch_names) in &rows {
+                    let mfi = ch_names.iter().position(|c| c.eq_ignore_ascii_case(&sel_name))
+                        .and_then(|k| medians.get(k).copied()).unwrap_or(f64::NAN);
+                    s.push_str(&format!("{}\t{}\t{}{}\t{}\t{:.2}\t{:.2}\t{}\n",
+                        group, sample, "  ".repeat(*depth), name, count, pp, pt, fmt(mfi)));
+                }
+                ui.output_mut(|o| o.copied_text = s);
+                self.status = "Copied batch table to clipboard (TSV).".into();
+            }
             ui.horizontal(|ui| {
                 ui.label("MFI channel:");
                 egui::ComboBox::from_id_salt("batchch").selected_text(&channels[ci]).show_ui(ui, |ui| {
@@ -3222,6 +3485,78 @@ impl FlowCytoApp {
                         });
                     });
                 });
+        }
+
+        // ── Quick chart: one population's metric across samples, grouped by tag ──
+        if !rows.is_empty() {
+            ui.separator();
+            egui::CollapsingHeader::new("📊 Chart across samples").id_salt("batch_chart_hdr").show(ui, |ui| {
+                let cur_name = match self.batch_plot_pop {
+                    None => "All events".to_string(),
+                    Some(id) => self.gates.iter().find(|g| g.id == id).map(|g| g.name.clone()).unwrap_or_else(|| "All events".into()),
+                };
+                let gate_opts: Vec<(Option<u32>, String)> = std::iter::once((None, "All events".to_string()))
+                    .chain(self.gates.iter().map(|g| (Some(g.id), g.name.clone()))).collect();
+                let mfi_name = channels.get(self.batch_channel.min(channels.len().saturating_sub(1))).cloned().unwrap_or_default();
+                ui.horizontal(|ui| {
+                    ui.label("Population:");
+                    egui::ComboBox::from_id_salt("batchplotpop").selected_text(&cur_name).show_ui(ui, |ui| {
+                        for (id, name) in &gate_opts { ui.selectable_value(&mut self.batch_plot_pop, *id, name); }
+                    });
+                    ui.separator();
+                    ui.label("Y:");
+                    ui.selectable_value(&mut self.batch_plot_metric, BatchMetric::PctParent, "% parent");
+                    ui.selectable_value(&mut self.batch_plot_metric, BatchMetric::PctTotal, "% total");
+                    ui.selectable_value(&mut self.batch_plot_metric, BatchMetric::Mfi, "MFI");
+                    if self.batch_plot_metric == BatchMetric::Mfi {
+                        ui.label(RichText::new(format!("({})", mfi_name)).small().color(Color32::GRAY));
+                    }
+                });
+
+                let metric = self.batch_plot_metric;
+                let sel = cur_name.clone();
+                let mut groups: Vec<String> = Vec::new();
+                for (g, _s, name, _d, _c, _pp, _pt, _m, _cn) in &rows {
+                    if name == &sel && !groups.contains(g) { groups.push(g.clone()); }
+                }
+                let mut series: Vec<Vec<[f64; 2]>> = vec![Vec::new(); groups.len()];
+                for (g, _s, name, _d, _c, pp, pt, medians, ch_names) in &rows {
+                    if name != &sel { continue; }
+                    let val = match metric {
+                        BatchMetric::PctParent => *pp,
+                        BatchMetric::PctTotal => *pt,
+                        BatchMetric::Mfi => ch_names.iter().position(|c| c.eq_ignore_ascii_case(&mfi_name))
+                            .and_then(|k| medians.get(k).copied()).unwrap_or(f64::NAN),
+                    };
+                    if !val.is_finite() { continue; }
+                    if let Some(gi) = groups.iter().position(|x| x == g) {
+                        let k = series[gi].len();
+                        let jitter = (k as f64 % 5.0) * 0.06 - 0.12; // spread points within a group
+                        series[gi].push([gi as f64 + jitter, val]);
+                    }
+                }
+                let ylab = metric.label();
+                let gnames = groups.clone();
+                if groups.is_empty() {
+                    ui.label(RichText::new("Tag samples with a group (Samples panel) and pick a population.").small().color(Color32::GRAY));
+                } else {
+                    Plot::new("batch_chart").height(260.0).allow_scroll(false)
+                        .legend(Legend::default())
+                        .y_axis_label(ylab)
+                        .x_axis_formatter(move |gm: GridMark, _r| {
+                            let i = gm.value.round() as isize;
+                            if i >= 0 && (i as usize) < gnames.len() && (gm.value - i as f64).abs() < 0.01 {
+                                gnames[i as usize].clone()
+                            } else { String::new() }
+                        })
+                        .show(ui, |pu| {
+                            for (gi, pts) in series.iter().enumerate() {
+                                pu.points(Points::new(PlotPoints::new(pts.clone()))
+                                    .radius(4.0).color(sample_color(gi)).name(&groups[gi]));
+                            }
+                        });
+                }
+            });
         }
 
         if !skipped.is_empty() {
@@ -3659,6 +3994,52 @@ fn smooth_hist(counts: &[f64], radius: usize) -> Vec<f64> {
     pass(&pass(counts))
 }
 
+/// Make a string safe to embed in a filename.
+fn sanitize(s: &str) -> String {
+    s.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
+}
+
+/// Per-user path where the recent-files list is stored.
+fn recent_store_path() -> Option<PathBuf> {
+    let dir = if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support/flowcyto"))
+    } else if cfg!(windows) {
+        std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("flowcyto"))
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+            .map(|c| c.join("flowcyto"))
+    };
+    dir.map(|d| d.join("recent.json"))
+}
+
+/// Load the recent-files list, dropping entries that no longer exist on disk.
+fn load_recent() -> Vec<PathBuf> {
+    let p = match recent_store_path() { Some(p) => p, None => return Vec::new() };
+    let txt = match std::fs::read_to_string(&p) { Ok(t) => t, Err(_) => return Vec::new() };
+    serde_json::from_str::<Vec<String>>(&txt).unwrap_or_default()
+        .into_iter().map(PathBuf::from).filter(|p| p.exists()).collect()
+}
+
+/// Axis-aligned bounding box of a 2-D gate in display coords (xmin,xmax,ymin,ymax).
+/// `None` for 1-D interval gates.
+fn shape_display_bbox(s: &GateShape) -> Option<(f64, f64, f64, f64)> {
+    match s {
+        GateShape::Rect { x_min, x_max, y_min, y_max } => Some((*x_min, *x_max, *y_min, *y_max)),
+        GateShape::Ellipse { cx, cy, rx, ry, .. } => Some((cx - rx, cx + rx, cy - ry, cy + ry)),
+        GateShape::Polygon { vertices } => {
+            if vertices.is_empty() { return None; }
+            let (mut xmn, mut xmx, mut ymn, mut ymx) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+            for v in vertices {
+                xmn = xmn.min(v[0]); xmx = xmx.max(v[0]);
+                ymn = ymn.min(v[1]); ymx = ymx.max(v[1]);
+            }
+            Some((xmn, xmx, ymn, ymx))
+        }
+        GateShape::Range { .. } => None,
+    }
+}
+
 fn shape_label(s: &GateShape) -> &'static str {
     match s {
         GateShape::Rect { .. } => "rect",
@@ -3995,6 +4376,9 @@ struct MenuState {
     undo: muda::MenuId,
     redo: muda::MenuId,
     theme: muda::MenuId,
+    zoom_in: muda::MenuId,
+    zoom_out: muda::MenuId,
+    zoom_reset: muda::MenuId,
     tabs: [muda::MenuId; 5], // Plot, Histogram, Stats, Batch, Spillover
 }
 
@@ -4042,9 +4426,15 @@ fn build_menu() -> MenuState {
     let tab_items: Vec<MenuItem> = names.iter().enumerate()
         .map(|(i, n)| MenuItem::new(*n, true, acc(&format!("CmdOrCtrl+{}", i + 1)))).collect();
     let theme = MenuItem::new("Toggle Light/Dark", true, None);
+    let zoom_in = MenuItem::new("Zoom In", true, acc("CmdOrCtrl+Plus"));
+    let zoom_out = MenuItem::new("Zoom Out", true, acc("CmdOrCtrl+-"));
+    let zoom_reset = MenuItem::new("Actual Size", true, acc("CmdOrCtrl+0"));
     let tab_refs: Vec<&dyn IsMenuItem> = tab_items.iter().map(|m| m as &dyn IsMenuItem).collect();
     let _ = view_m.append_items(&tab_refs);
-    let _ = view_m.append_items(&[&PredefinedMenuItem::separator() as &dyn IsMenuItem, &theme]);
+    let _ = view_m.append_items(&[
+        &PredefinedMenuItem::separator() as &dyn IsMenuItem, &theme,
+        &PredefinedMenuItem::separator(), &zoom_in, &zoom_out, &zoom_reset,
+    ]);
 
     let _ = menu.append_items(&[&app_m, &file_m, &edit_m, &view_m]);
     menu.init_for_nsapp();
@@ -4058,6 +4448,9 @@ fn build_menu() -> MenuState {
         undo: undo.id().clone(),
         redo: redo.id().clone(),
         theme: theme.id().clone(),
+        zoom_in: zoom_in.id().clone(),
+        zoom_out: zoom_out.id().clone(),
+        zoom_reset: zoom_reset.id().clone(),
         tabs: std::array::from_fn(|i| tab_items[i].id().clone()),
         _menu: menu,
     }
@@ -4107,7 +4500,7 @@ pub fn run_gui(initial_file: Option<&Path>) {
     };
     eframe::run_native("flowcyto", options, Box::new(|cc| {
         setup_style(&cc.egui_ctx);
-        let mut app = FlowCytoApp::default();
+        let mut app = FlowCytoApp { recent_files: load_recent(), ..Default::default() };
         if let Some(p) = initial_file { app.load_file(p); }
         #[cfg(target_os = "macos")]
         { app.menu = Some(build_menu()); }
