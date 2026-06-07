@@ -50,11 +50,10 @@ pub fn check_latest() -> Result<UpdateInfo, String> {
         .get("tag_name")
         .and_then(|v| v.as_str())
         .ok_or("response had no tag_name")?;
-    let url = json
-        .get("html_url")
-        .and_then(|v| v.as_str())
-        .unwrap_or(RELEASES_PAGE)
-        .to_string();
+    // Always our own releases page — never a URL lifted from the response. The result
+    // is later handed to the platform URL-opener (`open::that`), so we don't let a
+    // network-controlled string reach that sink. (Audit N2.)
+    let url = RELEASES_PAGE.to_string();
     let latest = tag.trim_start_matches('v').to_string();
     let current = current_version().to_string();
     let newer = is_newer(&latest, &current);

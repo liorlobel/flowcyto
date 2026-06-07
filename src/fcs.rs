@@ -361,7 +361,8 @@ fn parse_data(
                     // The mask is the smallest 2ⁿ−1 that covers $PnR, so it works for
                     // non-power-of-2 ranges too (range-1 alone would corrupt those).
                     let mask = if p.range >= 1.0 && p.range.fract() == 0.0 {
-                        (p.range as u64).next_power_of_two() - 1
+                        // checked: $PnR > 2^63 would overflow next_power_of_two (audit N5).
+                        (p.range as u64).checked_next_power_of_two().map(|p| p - 1).unwrap_or(u64::MAX)
                     } else {
                         u64::MAX
                     };

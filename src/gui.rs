@@ -93,18 +93,19 @@ fn lerp_anchors(t: f32, a: &[(u8, u8, u8)]) -> (u8, u8, u8) {
     (m(a[i].0, a[i + 1].0), m(a[i].1, a[i + 1].1), m(a[i].2, a[i + 1].2))
 }
 
-// 9-anchor samples of the matplotlib maps — smooth enough for density shading.
+// 9-anchor samples of the matplotlib maps, sampled at t = k/8 from the reference
+// 256-entry tables (verified against matplotlib's _cm_listed.py: max Δ ≤ 1/255).
 const VIRIDIS: [(u8, u8, u8); 9] = [
-    (68, 1, 84), (72, 40, 120), (62, 74, 137), (49, 104, 142), (38, 130, 142),
-    (31, 158, 137), (53, 183, 121), (109, 205, 89), (253, 231, 37),
+    (68, 1, 84), (71, 45, 123), (59, 82, 139), (44, 114, 142), (33, 145, 140),
+    (39, 173, 129), (92, 200, 99), (170, 220, 50), (253, 231, 37),
 ];
 const MAGMA: [(u8, u8, u8); 9] = [
-    (0, 0, 4), (28, 16, 68), (79, 18, 123), (129, 37, 129), (181, 54, 122),
+    (0, 0, 4), (29, 17, 71), (81, 18, 124), (131, 38, 129), (183, 55, 121),
     (229, 80, 100), (251, 135, 97), (254, 194, 135), (252, 253, 191),
 ];
 const CIVIDIS: [(u8, u8, u8); 9] = [
-    (0, 32, 76), (0, 42, 102), (47, 64, 103), (81, 86, 106), (110, 109, 109),
-    (143, 133, 103), (180, 159, 89), (221, 186, 69), (255, 234, 70),
+    (0, 34, 78), (26, 56, 111), (67, 78, 108), (97, 101, 111), (125, 124, 120),
+    (154, 147, 118), (187, 173, 109), (221, 200, 88), (254, 232, 56),
 ];
 
 /// Turbo via the standard degree-5 polynomial approximation (Mikhailov/Google).
@@ -823,6 +824,8 @@ impl FlowCytoApp {
     /// Effective membership mask of a population (AND of the gate with its ancestors).
     fn pop_mask(&self, pop: u32) -> Vec<bool> {
         let fcs = match &self.fcs { Some(f) => f, None => return Vec::new() };
+        // Match the buffer guard every other engine consumer uses (audit N4).
+        if self.compensated.len() < fcs.n_events * fcs.n_params() { return Vec::new(); }
         let own = compute_own_masks(&self.gates, &self.compensated, &fcs.parameters, fcs.n_events);
         let by_id: HashMap<u32, &Gate> = self.gates.iter().map(|g| (g.id, g)).collect();
         effective_mask(pop, &by_id, &own, fcs.n_events)
@@ -1241,7 +1244,7 @@ impl FlowCytoApp {
         if hovering {
             egui::Area::new(egui::Id::new("drop_hint")).fixed_pos(egui::pos2(20.0, 40.0)).show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.label(RichText::new("⤓ Drop .fcs files to open").size(16.0));
+                    ui.label(RichText::new(format!("{} Drop .fcs files to open", icon::ARROW_LINE_DOWN)).size(16.0));
                 });
             });
         }
@@ -1548,7 +1551,7 @@ impl FlowCytoApp {
 
         // Apply the X channel's transform to every fluorescence channel at once —
         // saves setting Logicle/asinh one-by-one across a big panel.
-        if ui.add(egui::Button::new(RichText::new("⇊ X scale → all fluorescence").small()))
+        if ui.add(egui::Button::new(RichText::new(format!("{} X scale → all fluorescence", icon::ARROW_LINE_DOWN)).small()))
             .on_hover_text("Set every fluorescence channel's scale to match the current X channel")
             .clicked()
         {
@@ -1723,16 +1726,16 @@ impl FlowCytoApp {
 
         // Undo / redo
         ui.horizontal(|ui| {
-            if ui.add_enabled(!self.undo_stack.is_empty(), egui::Button::new("↶ Undo"))
+            if ui.add_enabled(!self.undo_stack.is_empty(), egui::Button::new(format!("{} Undo", icon::ARROW_ARC_LEFT)))
                 .on_hover_text("Undo gate change (Ctrl/Cmd+Z)").clicked() { self.undo(); }
-            if ui.add_enabled(!self.redo_stack.is_empty(), egui::Button::new("↷ Redo"))
+            if ui.add_enabled(!self.redo_stack.is_empty(), egui::Button::new(format!("{} Redo", icon::ARROW_ARC_RIGHT)))
                 .on_hover_text("Redo (Ctrl/Cmd+Shift+Z)").clicked() { self.redo(); }
         });
 
         // Save / load
         ui.horizontal(|ui| {
-            if ui.button("💾 Save").clicked() { self.save_gates(); }
-            if ui.button("📁 Load").clicked() { self.load_gates(); }
+            if ui.button(format!("{} Save", icon::FLOPPY_DISK)).clicked() { self.save_gates(); }
+            if ui.button(format!("{} Load", icon::FOLDER_OPEN)).clicked() { self.load_gates(); }
         });
 
         // Boolean (AND/OR/NOT) gate builder.
@@ -1924,7 +1927,7 @@ impl FlowCytoApp {
                 }
                 ui.horizontal(|ui| {
                     ui.add_space(ind);
-                    if ui.button("💾 Export events → .fcs")
+                    if ui.button(format!("{} Export events → .fcs", icon::EXPORT))
                         .on_hover_text("Write this population's events to a new FCS file").clicked()
                     { export_gid = Some(gid); }
                 });
@@ -2635,7 +2638,7 @@ impl FlowCytoApp {
             ui.checkbox(&mut self.lock_view, format!("{} Lock view", icon::LOCK_SIMPLE))
                 .on_hover_text("Freeze pan/zoom so the plot holds still while gating (uncheck to drag-pan / pinch-zoom)");
             if !self.grid_mode && !self.lock_view
-                && ui.button("⤢ Fit").on_hover_text("Reset zoom to fit all data").clicked()
+                && ui.button(format!("{} Fit", icon::ARROWS_OUT)).on_hover_text("Reset zoom to fit all data").clicked()
             {
                 self.x_manual = false; self.y_manual = false; self.fit_view = true; self.scatter = None;
             }
@@ -3308,7 +3311,7 @@ impl FlowCytoApp {
         let mut do_export = false;
         let mut do_copy = false;
         ui.horizontal(|ui| {
-            if ui.button("💾 Export CSV (tidy)").clicked() { do_export = true; }
+            if ui.button(format!("{} Export CSV (tidy)", icon::EXPORT)).clicked() { do_export = true; }
             if ui.button(format!("{} Copy (TSV)", icon::COPY)).on_hover_text("Copy the table as tab-separated text (paste into R/Excel)").clicked() { do_copy = true; }
             ui.label(RichText::new(format!("{} populations × {} channels", table.rows.len(), table.channels.len()))
                 .small().color(Color32::GRAY));
@@ -3583,8 +3586,8 @@ impl FlowCytoApp {
         ui.horizontal(|ui| {
             ui.heading("Batch");
             if ui.add_enabled(!running, egui::Button::new("▶ Run over all samples")).clicked() { do_run = true; }
-            if running && ui.button("✖ Cancel").clicked() { do_cancel = true; }
-            if self.batch.is_some() && !running && ui.button("💾 Export combined CSV").clicked() { do_export = true; }
+            if running && ui.button(format!("{} Cancel", icon::X)).clicked() { do_cancel = true; }
+            if self.batch.is_some() && !running && ui.button(format!("{} Export combined CSV", icon::EXPORT)).clicked() { do_export = true; }
             if self.batch.is_some() && !running && ui.button(format!("{} Copy (TSV)", icon::COPY)).on_hover_text("Copy the visible table as tab-separated text").clicked() { do_copy = true; }
         });
         ui.label(RichText::new(format!(
@@ -3907,8 +3910,8 @@ impl FlowCytoApp {
             }
             if ui.button(format!("{} Compute from controls…", icon::FLASK)).clicked() { act_compute = true; }
             if ui.button(format!("{} Load matrix…", icon::FOLDER_OPEN)).clicked() { act_load = true; }
-            if active.is_some() && ui.button("💾 Save matrix…").clicked() { act_save = true; }
-            if active.is_some() && ui.button("📝 Write new .fcs…").clicked() { act_write = true; }
+            if active.is_some() && ui.button(format!("{} Save matrix…", icon::FLOPPY_DISK)).clicked() { act_save = true; }
+            if active.is_some() && ui.button(format!("{} Write new .fcs…", icon::FILE_PLUS)).clicked() { act_write = true; }
         });
         if override_active {
             ui.label(RichText::new("Drag any cell to edit. Diagonal is normally 1.0.").small().color(Color32::GRAY));

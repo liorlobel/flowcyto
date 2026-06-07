@@ -8,6 +8,97 @@
 > fallback is correct and tested; surfacing it cleanly needs a UI change not worth the
 > risk for a Low). This file is retained as the audit record.
 
+---
+
+# v0.1.9 re-audit (2026-06-07) — addendum
+
+> **Status: all of N1–N7 FIXED in v0.1.10**, plus the two follow-ups (Phosphor MIT
+> license added next to the Inter OFL; the hand-typed Viridis/Cividis colormap LUTs —
+> which were off by up to 61/255 — replaced with reference matplotlib values, Δ≤1).
+> 109 tests pass, clippy `-D warnings` clean. N6 also makes the "replaces every UI
+> emoji" claim true again.
+
+Fresh full audit of the current tree (**v0.1.9, commit `3a848e2`, ~8.9k LOC**) after
+three releases of change since the v0.1.6 audit above: the hardening fixes (v0.1.7),
+the network-touching in-app updater (`update.rs`, v0.1.8), and a heavy `gui.rs`
+redesign (+480 lines: fonts/icons/theme/colormaps, v0.1.9). Five parallel review
+passes — update/network · numeric-core edges · gui state/regression · gui
+rendering · CLI/deps/CI — **every finding re-verified at its `file:line`.** Static
+analysis (no exploit run). The agents cross-checked against the fixed list above so
+this is *new since v0.1.6 + regressions*, not a rehash.
+
+**Headline: the codebase is in good shape.** All prior fixes survived the churn —
+**5/5 GUI fixes confirmed intact**, **5/5 v0.1.7 numeric fixes verified sound** on the
+untested edges, and **`cargo audit` reports 0 vulnerabilities** (the new pure-Rust
+network stack is clean). No High/Medium. Seven Lows (one Low–Medium), summarized:
+
+| # | Severity | Finding | Location |
+|---|---|---|---|
+| N1 | Low–Med | `compute_spillover`'s `median()` doesn't drop non-finite — the one median site the v0.1.7 M1d fix **missed**; CLI `compute-spillover -o` can silently write a NaN/wrong matrix to disk | `compensation.rs:271-282` |
+| N2 | Low | `open::that(&info.url)` opens a **response-controlled** URL (`html_url` from the API) — the app's only attacker-influenceable sink | `update.rs:53-57` → `gui.rs:1443` |
+| N3 | Low | **Windows** CI interpolates `${{ github.ref_name }}` into PowerShell **source** (script-injection sink with a `contents:write` token); macOS uses the safe env-var form | `windows-installer.yml:58` |
+| N4 | Low (latent) | `pop_mask` / `grid_kept` omit the `compensated.len()` guard their siblings have (same class as the fixed L8) — latent OOB panic, not reachable on current frame ordering | `gui.rs:824`, `:677` |
+| N5 | Low | integer range bitmask `next_power_of_two() - 1` overflows for `$PnR > 2^63` (debug panic; release wraps to a benign no-op mask) | `fcs.rs:364` |
+| N6 | Low (cosmetic) | Phosphor-icon migration **incomplete** — ~13 buttons still use raw emoji/symbols (`💾`×5, `📁`,`📝`,`✖`,`↶`,`↷`,`⇊`,`⤢`,`⤓`); gate Save/Load (`💾`/`📁`) sit right beside session Save/Load that already use Phosphor | `gui.rs:1734-1735` + 11 more |
+| N7 | Low (hardening) | CI actions pinned to mutable tags (`@v6`/`@v7`) not SHAs; Windows job skips the clippy `-D warnings` gate the macOS job runs | both workflows |
+
+### Detail on the two worth acting on first
+
+**N1 — the missed non-finite median (the most actionable).** `compensation.rs:271-282`:
+the standalone `median()` (used by `channel_medians` → `compute_spillover`) sorts with
+`partial_cmp().unwrap_or(Equal)` and returns `vals[n/2]` **without** the
+`retain(is_finite)` that v0.1.7 added to the popstats and stats medians. A NaN raw
+event in a control file survives the sort, becomes the channel median, bypasses the
+`denom <= 0.0` guard (false for NaN), and yields a NaN matrix row — which the CLI
+`compute-spillover -o` then writes to disk via `save_matrix_file` (no finiteness check
+on **save**; `validate_square` only runs on load). The GUI path is safe (it rebuilds
+via `from_parts`, which rejects non-finite). **Fix:** filter non-finite at the top of
+`median()` (mirror `med_mean_cv`), and/or add a finiteness check to the matrix writer.
+
+**N3 — Windows CI script injection.** `windows-installer.yml:58` is `$tag = "${{ github.ref_name }}"`
+— GitHub substitutes the context into the PowerShell source *before* execution, and
+PowerShell evaluates `$(...)` inside double-quoted strings, while `git check-ref-format`
+permits `$()"` in tag names. The macOS workflow (`:50`, `tag="${GITHUB_REF_NAME}"`) is
+the correct pattern. **Fix:** pass via `env:` and read `$env:TAG`. (Low — only someone
+who can push tags can trigger it, but trivial to close.)
+
+### Confirmed intact / clean (so they aren't re-litigated)
+- **5/5 prior GUI fixes intact**, code re-read: `load_session` square-validates the
+  override + reconciles `hist_sample_pop`/`hist_hidden`/`scatter_hidden`/`bool_refs`;
+  `poll_batch` distinguishes `Done` vs disconnect (`got_done` checked first); Stats-tab
+  `compensated.len()` guard present; quadrant gates half-open via `next_down()`;
+  `shape_display_bbox` accounts for ellipse rotation.
+- **5/5 v0.1.7 numeric fixes sound** on untested edges: gating unevaluable-tracking
+  (transitive via the `unevaluable` set; cycle/self-ref terminate), compensation
+  ill-conditioning gate (`max|inv|>1e6` rejects no plausible separable matrix — keep
+  it), `parse_spillover` checked arithmetic + finiteness, fcs `$PAR×$TOT` bound (rejects
+  no valid file), popstats/stats non-finite filtering (true no-op on finite data).
+- **New v0.1.9 logic clean**: colormap session round-trip + legacy `viridis`-bool
+  back-compat correct; `lerp_anchors` index math in-bounds (NaN saturates to 0, no
+  panic); `turbo` clamped; font/style ordering correct; `themed_visuals` correct for
+  dark **and** light (`linear_multiply` scales opacity, verified).
+- **Dependencies clean**: `cargo audit` = **0 vulnerabilities** (10 informational
+  unmaintained/unsound, all pre-existing — the Linux-only GTK cluster via `muda`, and
+  `paste` via `nalgebra`; none in the new network surface). Pure-Rust `rustls` stack,
+  **no `openssl`/`native-tls`**, no async runtime, no process-spawn beyond `open`'s
+  platform opener (URL passed as a process arg, not via a shell). All deps from
+  crates.io; no git/path/patched deps.
+
+### Benign notes (no fix needed)
+- The native "Check for Updates…" **menu** path lacks the double-click guard the
+  toolbar button has — rapid menu clicks orphan harmless 15 s-bounded threads. One-line
+  guard if desired.
+- Still no `[profile.release]` → overflow-checks off in release. The one overflow that
+  mattered (v0.1.6 M2) is now guarded by explicit `checked_mul`, so this is no longer a
+  live crash vector; `overflow-checks = true` would be belt-and-suspenders.
+
+### Suggested fix order
+**N1** (real silent-bad-output through the CLI) → **N3** (CI injection, one-line) →
+**N2** (open the constant `RELEASES_PAGE`, drop `html_url`) → **N4/N5** (cheap guards) →
+**N6** (cosmetic emoji sweep) → **N7** (CI hardening). All Low; none blocks a release.
+
+---
+
 Full-codebase audit of the ~8.2k-LOC Rust tree at commit `5c8ad67`. Six parallel
 review passes (FCS binary I/O · compensation+transforms · gating+stats · CLI ·
 GUI state/cache · GUI gating geometry); **every finding below was independently

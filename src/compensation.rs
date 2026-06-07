@@ -110,6 +110,11 @@ pub fn load_matrix_file(path: &std::path::Path) -> Result<(Vec<String>, Vec<Vec<
 
 /// Save a spillover matrix to CSV (default) or JSON (if path ends in .json).
 pub fn save_matrix_file(path: &std::path::Path, channels: &[String], rows: &[Vec<f64>]) -> Result<()> {
+    // Never persist a non-finite matrix (e.g. from a degenerate control) — it would
+    // poison any later `compensate`. (Defense-in-depth alongside the median fix.)
+    if rows.iter().flatten().any(|v| !v.is_finite()) {
+        bail!("refusing to write a spillover matrix containing non-finite (NaN/Inf) values");
+    }
     let is_json = path.extension().map(|e| e.eq_ignore_ascii_case("json")).unwrap_or(false);
     if is_json {
         let obj = serde_json::json!({ "channels": channels, "matrix": rows });
@@ -244,8 +249,8 @@ fn channel_medians(fcs: &FcsFile, channels: &[String]) -> Result<Vec<f64>> {
         .map(|ch| {
             let idx = fcs.param_index(ch)
                 .with_context(|| format!("channel '{}' not found in control file", ch))?;
-            let mut vals = fcs.channel_values(idx);
-            Ok(median(&mut vals))
+            let vals = fcs.channel_values(idx);
+            Ok(median(&vals))
         })
         .collect()
 }
@@ -268,16 +273,19 @@ pub fn fluor_token_in_filename(channels: &[String], filename: &str) -> Option<us
 }
 
 /// Median (averages the two middle values for even N, matching R's `median`).
-fn median(vals: &mut [f64]) -> f64 {
-    let n = vals.len();
+/// Non-finite values are dropped first so a NaN/Inf raw event in a control can't
+/// poison the computed spillover (mirrors the popstats/stats medians).
+fn median(vals: &[f64]) -> f64 {
+    let mut v: Vec<f64> = vals.iter().copied().filter(|x| x.is_finite()).collect();
+    let n = v.len();
     if n == 0 {
         return 0.0;
     }
-    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     if n % 2 == 1 {
-        vals[n / 2]
+        v[n / 2]
     } else {
-        0.5 * (vals[n / 2 - 1] + vals[n / 2])
+        0.5 * (v[n / 2 - 1] + v[n / 2])
     }
 }
 
@@ -635,11 +643,10 @@ mod tests {
 
     #[test]
     fn median_even_and_odd() {
-        let mut odd = [3.0, 1.0, 2.0];
-        assert_eq!(median(&mut odd), 2.0);
-        let mut even = [4.0, 1.0, 3.0, 2.0];
-        assert_eq!(median(&mut even), 2.5);
-        let mut empty: [f64; 0] = [];
-        assert_eq!(median(&mut empty), 0.0);
+        assert_eq!(median(&[3.0, 1.0, 2.0]), 2.0);
+        assert_eq!(median(&[4.0, 1.0, 3.0, 2.0]), 2.5);
+        assert_eq!(median(&[] as &[f64]), 0.0);
+        // Non-finite values are dropped (audit N1): median over the finite {2,4,6}.
+        assert_eq!(median(&[2.0, f64::NAN, 4.0, f64::INFINITY, 6.0]), 4.0);
     }
 }
