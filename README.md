@@ -66,6 +66,10 @@ toolbar's **🖫 Save session** stores everything — samples, gates, transforms
 compensation — to reopen later.
 
 ### Handy extras
+- **Auto-gate suggestions** (in the Gates panel — starting points you review):
+  **Suggest singlets** fits a diagonal FSC-A × FSC-H band, and **Auto-threshold X**
+  splits the current channel at its density valley (handles a small/rare positive
+  population, where a simple Otsu cut would not).
 - **QC** tab: a per-tube acquisition-quality scan across the whole workspace —
   event count, **%viable** (pick any gate as the live/viable population; its % of
   parent comes from the same validated gating engine), **flow-rate stability**

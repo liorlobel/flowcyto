@@ -6,6 +6,7 @@
 // console at startup — see `maybe_attach_console`.)
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
+mod autogate;
 mod compensation;
 mod fcs;
 mod fcs_write;

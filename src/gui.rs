@@ -1082,6 +1082,96 @@ impl FlowCytoApp {
         self.status = format!("Added linked quadrant on {}×{}", xs, ys);
     }
 
+    /// Compensated (linear) values of channel `ci` over the active "gate-from-here"
+    /// population (or all events). Used by the auto-gate suggestions.
+    fn channel_for_pop(&self, ci: usize) -> Vec<f64> {
+        let fcs = match &self.fcs { Some(f) => f, None => return Vec::new() };
+        let n = fcs.n_params();
+        if ci >= n || self.compensated.len() < fcs.n_events * n { return Vec::new(); }
+        let mask = self.active_pop.map(|p| self.pop_mask(p));
+        (0..fcs.n_events)
+            .filter(|&e| mask.as_ref().map(|m| m.get(e).copied().unwrap_or(false)).unwrap_or(true))
+            .map(|e| self.compensated[e * n + ci])
+            .collect()
+    }
+
+    /// Auto-threshold the current X channel at the density valley between its two
+    /// peaks (a *suggestion* — the user adjusts it). Computed in the channel's current
+    /// display space, so it works on logicle/log fluorescence.
+    fn auto_threshold(&mut self) {
+        let (xi, name, np) = match &self.fcs {
+            Some(f) => {
+                let xi = self.x_ch.min(f.n_params().saturating_sub(1));
+                (xi, f.parameters.get(xi).map(|p| p.name.clone()).unwrap_or_default(), f.n_params())
+            }
+            None => return,
+        };
+        if np == 0 { return; }
+        let xt = self.cur_tf(xi);
+        let ct = xt.compile();
+        let vals: Vec<f64> = self.channel_for_pop(xi).iter().map(|&v| ct.forward(v)).collect();
+        match crate::autogate::valley_threshold(&vals, 128) {
+            Some((thr, depth)) => {
+                let dmax = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let xmax = if dmax.is_finite() && dmax > thr { dmax } else { thr };
+                self.push_undo();
+                let id = self.next_gate_id; self.next_gate_id += 1;
+                self.gates.push(Gate {
+                    id, name: format!("{}+ (auto)", short_chan(&name)),
+                    parent: self.new_gate_parent,
+                    x_channel: name.clone(), y_channel: name,
+                    x_transform: xt.clone(), y_transform: xt,
+                    shape: GateShape::Range { x_min: thr, x_max: xmax },
+                    quad_group: None,
+                });
+                self.needs_regate = true;
+                self.status = format!("Auto-threshold (valley depth {:.0}%) — review & adjust", depth * 100.0);
+            }
+            None => self.status = "No clear two populations on this channel — draw a gate manually.".into(),
+        }
+    }
+
+    /// Suggest a singlet gate (FSC-A × FSC-H) as a diagonal band — a starting point.
+    fn suggest_singlets(&mut self) {
+        let found = self.fcs.as_ref().and_then(|fcs| {
+            let pick = |f: &dyn Fn(&str) -> bool| fcs.parameters.iter().position(|p| f(&p.name));
+            let ai = pick(&|n| n.eq_ignore_ascii_case("FSC-A"))
+                .or_else(|| pick(&|n| { let u = n.to_uppercase(); u.starts_with("FSC") && u.ends_with("-A") }));
+            let hi = pick(&|n| n.eq_ignore_ascii_case("FSC-H"))
+                .or_else(|| pick(&|n| { let u = n.to_uppercase(); u.starts_with("FSC") && u.ends_with("-H") }));
+            match (ai, hi) {
+                (Some(a), Some(h)) => Some((a, h, fcs.parameters[a].name.clone(), fcs.parameters[h].name.clone())),
+                _ => None,
+            }
+        });
+        let (ai, hi, an, hn) = match found {
+            Some(x) => x,
+            None => { self.status = "Need FSC-A and FSC-H channels for a singlet gate.".into(); return; }
+        };
+        let area = self.channel_for_pop(ai);
+        let height = self.channel_for_pop(hi);
+        match crate::autogate::singlet_polygon(&area, &height, 0.15) {
+            Some(vertices) => {
+                self.push_undo();
+                let id = self.next_gate_id; self.next_gate_id += 1;
+                let lin = AxisTransform::Linear; // scatter: display coords == data coords
+                self.gates.push(Gate {
+                    id, name: "Singlets (auto)".into(),
+                    parent: self.new_gate_parent,
+                    x_channel: an, y_channel: hn,
+                    x_transform: lin.clone(), y_transform: lin,
+                    shape: GateShape::Polygon { vertices },
+                    quad_group: None,
+                });
+                self.x_ch = ai; self.y_ch = hi; // show FSC-A × FSC-H so the gate is visible
+                self.needs_rescatter = true;
+                self.needs_regate = true;
+                self.status = "Suggested singlet gate on FSC-A × FSC-H — review & adjust.".into();
+            }
+            None => self.status = "Couldn't fit a singlet gate from the scatter data.".into(),
+        }
+    }
+
     /// Commit a 1-D interval gate on the current X channel (drawn on a histogram).
     fn commit_range_gate(&mut self, x_min: f64, x_max: f64) {
         if self.fcs.is_none() { return; }
@@ -1740,6 +1830,14 @@ impl FlowCytoApp {
             self.draw_btn(ui, DrawMode::Polygon, &format!("{} Polygon", icon::POLYGON));
             self.draw_btn(ui, DrawMode::Quadrant, &format!("{} Quad", icon::CROSSHAIR_SIMPLE));
             self.draw_btn(ui, DrawMode::Edit, &format!("{} Edit", icon::PENCIL_SIMPLE));
+        });
+        ui.horizontal(|ui| {
+            if ui.button(format!("{} Suggest singlets", icon::MAGIC_WAND))
+                .on_hover_text("Fit a diagonal FSC-A × FSC-H singlet band (a starting suggestion to review)")
+                .clicked() { self.suggest_singlets(); }
+            if ui.button(format!("{} Auto-threshold X", icon::MAGIC_WAND))
+                .on_hover_text("Split the current X channel at its density valley (a suggestion to review)")
+                .clicked() { self.auto_threshold(); }
         });
         ui.label(RichText::new("keys: R/E/P/Q draw · G edit · V/Esc nav · ⌘Z undo")
             .small().color(Color32::GRAY))
