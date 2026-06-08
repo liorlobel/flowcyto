@@ -383,6 +383,8 @@ pub struct FlowCytoApp {
     last_plot_rect: Option<egui::Rect>, // screen rect of the most recent plot (for PNG crop)
     screenshot_pending: bool,           // a "Save plot PNG" request is awaiting the captured frame
     screenshot_sent: bool,              // the viewport screenshot command has been dispatched
+    #[cfg(target_os = "macos")]
+    dock_icon_ticks: u8,                // frames over which to (re)assert the Dock icon
 
     /// When Some, this matrix replaces the embedded $SPILLOVER everywhere.
     spill_override: Option<SpillOverride>,
@@ -472,6 +474,8 @@ impl Default for FlowCytoApp {
             last_plot_rect: None,
             screenshot_pending: false,
             screenshot_sent: false,
+            #[cfg(target_os = "macos")]
+            dock_icon_ticks: 0,
             spill_override: None,
             channel_tf: Vec::new(), x_ch: 0, y_ch: 1,
             x_manual: false, x_lo: 0.0, x_hi: 262144.0,
@@ -1343,6 +1347,16 @@ impl FlowCytoApp {
 impl eframe::App for FlowCytoApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.set_visuals(themed_visuals(self.dark_mode));
+
+        // macOS Dock icon: assert it over the first few frames. Setting it in the
+        // run_native closure does NOT stick — eframe/winit finishes launching after
+        // the closure and macOS installs the default icon during that, clobbering an
+        // early set. Re-applying for the first frames (after launch completes) wins.
+        #[cfg(target_os = "macos")]
+        if self.dock_icon_ticks < 8 {
+            set_dock_icon();
+            self.dock_icon_ticks += 1;
+        }
 
         if self.needs_reprocess {
             self.reprocess();
@@ -5370,6 +5384,35 @@ fn themed_visuals(dark: bool) -> egui::Visuals {
         color: Color32::from_black_alpha(if dark { 90 } else { 30 }),
     };
     v
+}
+
+/// Set the macOS Dock / application icon at runtime from the embedded PNG.
+///
+/// winit does not support setting the dock icon on macOS (`with_icon` is a no-op
+/// there), and the bundle's `.icns` only covers the installed `.app` — so the bare
+/// binary (e.g. `cargo run` / `flowcyto gui file.fcs` from a terminal) otherwise
+/// shows a generic icon. `NSApplication setApplicationIconImage:` fixes both: it
+/// applies to the bare binary and harmlessly re-asserts the bundle's icon.
+///
+/// Called from `run_native`'s creation closure, which already runs on the main
+/// thread (winit has created the `NSApplication` by then). Every step is guarded
+/// and bails silently on failure — a missing icon must never panic the GUI.
+#[cfg(target_os = "macos")]
+fn set_dock_icon() {
+    use objc2::ClassType; // brings `alloc` into scope
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::{MainThreadMarker, NSData};
+
+    // Same source PNG the .app bundle's .icns is generated from; NSImage decodes it.
+    const ICON_PNG: &[u8] = include_bytes!("../packaging/icon.png");
+
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let data = NSData::with_bytes(ICON_PNG);
+    let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) else { return };
+    let app = NSApplication::sharedApplication(mtm);
+    // SAFETY: called on the main thread with a valid NSImage we just constructed;
+    // setting the application icon image has no other invariants.
+    unsafe { app.setApplicationIconImage(Some(&image)); }
 }
 
 pub fn run_gui(initial_file: Option<&Path>) {

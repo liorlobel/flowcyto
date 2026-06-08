@@ -1098,7 +1098,7 @@ dependencies = [
 
 [[package]]
 name = "flowcyto"
-version = "0.1.16"
+version = "0.1.17"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -1112,6 +1112,9 @@ dependencies = [
  "image",
  "muda",
  "nalgebra",
+ "objc2 0.5.2",
+ "objc2-app-kit 0.2.2",
+ "objc2-foundation 0.2.2",
  "open",
  "rfd",
  "serde",

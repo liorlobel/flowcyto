@@ -1,6 +1,6 @@
 [package]
 name = "flowcyto"
-version = "0.1.16"
+version = "0.1.17"
 edition = "2021"
 description = "Flow cytometry FCS file analyzer — compensation, asinh transform, gating, stats"
 license = "MIT"
@@ -30,6 +30,13 @@ egui-phosphor = "0.7.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = "0.15"
+# Set the Dock/application icon at runtime so the bare binary (dev `cargo run`)
+# shows the app icon, not a generic one. winit can't set the macOS dock icon, and
+# the bundle's .icns only applies to the installed .app. Versions match winit's
+# (objc2 0.5.x / *-0.2.x) so no extra dependency copies are pulled in.
+objc2 = "0.5.2"
+objc2-app-kit = { version = "0.2.2", features = ["NSApplication", "NSImage", "NSResponder"] }
+objc2-foundation = { version = "0.2.2", features = ["NSData"] }
 
 [target.'cfg(windows)'.dependencies]
 # Reattach to the parent console for CLI use (the GUI build is windows-subsystem).
