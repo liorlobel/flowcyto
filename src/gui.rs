@@ -2258,7 +2258,13 @@ impl FlowCytoApp {
             Ok(s) => s,
             Err(e) => { self.status = format!("Session load error: {}", e); return; }
         };
+        self.apply_session(session, &path.display().to_string());
+    }
 
+    /// Apply a parsed [`Session`] to the app state (reset workspace, reopen files,
+    /// restore tags/transforms/gates/compensation). Split out of `load_session` so
+    /// it can be driven without a file dialog.
+    fn apply_session(&mut self, session: Session, src: &str) {
         // Reset the workspace, then reopen the saved files (sample 0 fresh).
         self.samples.clear();
         self.fcs = None; self.compensated.clear();
@@ -2321,7 +2327,7 @@ impl FlowCytoApp {
         self.needs_reprocess = true; self.needs_rescatter = true; self.needs_regate = true;
         self.scatter = None; self.hist_cache = None;
         self.status = if missing == 0 {
-            format!("Loaded session ({} samples) from {}", self.samples.len(), path.display())
+            format!("Loaded session ({} samples) from {}", self.samples.len(), src)
         } else {
             format!("Loaded session — {} {} file(s) missing and skipped", icon::WARNING, missing)
         };
