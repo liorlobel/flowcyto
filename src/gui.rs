@@ -3364,6 +3364,17 @@ impl FlowCytoApp {
 
         let drawing = self.hist_draw_interval;
         let lock_view = self.lock_view;
+        let view_bounds: Option<PlotBounds> = if lock_view {
+            let x0 = data.centers.first().copied().unwrap_or(0.0);
+            let x1 = data.centers.last().copied().unwrap_or(1.0);
+            let mx = (x1 - x0).abs().max(1e-9) * 0.02;
+            let ymax_d = match data.norm {
+                HistNorm::Modal => 1.0,
+                HistNorm::Count => data.series.iter().flat_map(|s| s.values.iter())
+                    .cloned().fold(0.0_f64, f64::max).max(1.0),
+            };
+            Some(PlotBounds::from_min_max([x0 - mx, -0.02], [x1 + mx, ymax_d * 1.08]))
+        } else { None };
         let cur_ds = self.drag_start;
         let cur_dc = self.drag_current;
         let mut next_ds = cur_ds;
@@ -3385,6 +3396,10 @@ impl FlowCytoApp {
             .x_grid_spacer(move |inp| nonlinear_grid(&xt_grid, lin_x, inp));
 
         let hist_response = plot.show(ui, |pu| {
+            if let Some(b) = view_bounds {
+                pu.set_plot_bounds(b);
+                pu.set_auto_bounds(egui::Vec2b::new(false, false));
+            }
             let bounds = pu.plot_bounds();
             let (ymin, ymax) = (bounds.min()[1], bounds.max()[1]);
 
@@ -5239,8 +5254,22 @@ fn setup_fonts(ctx: &egui::Context) {
         FontFamily::Name("heading".into()),
         vec!["Inter-SemiBold".to_owned(), "Inter".to_owned()],
     );
-    // Phosphor icon glyphs, merged into all families so icons render inline with text.
+    // Phosphor icon glyphs. `add_to_fonts` registers the "phosphor" font and inserts
+    // it at index 1 of the Proportional family (right after Inter, ahead of egui's
+    // default fallback fonts) so PUA icon codepoints resolve to Phosphor.
+    //
+    // NOTE: the bundled Inter TTFs are subset to DROP their Private-Use-Area glyphs.
+    // Upstream Inter maps ~745 PUA codepoints; since Inter sits at index 0 it would
+    // otherwise shadow the Phosphor icons (which live in the same PUA range) with
+    // blank/placeholder glyphs — the cause of the "weird icon" rendering. With those
+    // stripped, the index-1 Phosphor face is reached for every icon. Regenerate the
+    // subset with `assets/fonts/strip-pua.py` if the Inter TTFs are ever updated.
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+    // `add_to_fonts` only touches Proportional; add Phosphor to the heading and
+    // monospace families too, since headings (e.g. the QC tab) and some labels embed
+    // inline icons.
+    fonts.families.entry(FontFamily::Name("heading".into())).or_default().insert(1, "phosphor".to_owned());
+    fonts.families.entry(FontFamily::Monospace).or_default().insert(1, "phosphor".to_owned());
     ctx.set_fonts(fonts);
 }
 

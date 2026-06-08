@@ -1,8 +1,9 @@
 [package]
 name = "flowcyto"
-version = "0.1.15"
+version = "0.1.16"
 edition = "2021"
 description = "Flow cytometry FCS file analyzer — compensation, asinh transform, gating, stats"
+license = "MIT"
 
 [[bin]]
 name = "flowcyto"
