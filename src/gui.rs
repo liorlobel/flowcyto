@@ -5401,13 +5401,28 @@ fn app_icon() -> Option<egui::IconData> {
     Some(egui::IconData { rgba: img.into_raw(), width, height })
 }
 
+/// True when this process is running from a macOS `.app` bundle (vs a bare binary
+/// launched from a terminal). The bundle layout is `…/Foo.app/Contents/MacOS/foo`.
+#[cfg(target_os = "macos")]
+fn running_in_app_bundle() -> bool {
+    std::env::current_exe()
+        .map(|p| p.to_string_lossy().contains("/Contents/MacOS/"))
+        .unwrap_or(false)
+}
+
 /// Set the macOS Dock / application icon at runtime from the embedded PNG.
 ///
 /// winit does not support setting the dock icon on macOS (`with_icon` is a no-op
 /// there), and the bundle's `.icns` only covers the installed `.app` — so the bare
 /// binary (e.g. `cargo run` / `flowcyto gui file.fcs` from a terminal) otherwise
-/// shows a generic icon. `NSApplication setApplicationIconImage:` fixes both: it
-/// applies to the bare binary and harmlessly re-asserts the bundle's icon.
+/// shows a generic icon.
+///
+/// Done **only for the bare binary**. Inside a `.app` we leave the Dock on the
+/// bundle's own `.icns`: it's the same artwork, and the Dock renders a bundle icon
+/// consistently between the pinned (idle) and running states. (The icon art carries
+/// the standard macOS ~10% margin — `packaging/icon.png` is the 824/1024 grid — so
+/// it renders at the same size as neighboring apps; a full-bleed icon looked
+/// oversized when running vs pinned, which was the reported bug.)
 ///
 /// Called from `update()` (not the `run_native` closure — a closure-time set is
 /// clobbered when eframe finishes launching and macOS installs the default icon).
@@ -5418,6 +5433,8 @@ fn set_dock_icon() {
     use objc2::ClassType; // brings `alloc` into scope
     use objc2_app_kit::{NSApplication, NSImage};
     use objc2_foundation::{MainThreadMarker, NSData};
+
+    if running_in_app_bundle() { return; }
 
     let Some(mtm) = MainThreadMarker::new() else { return };
     let data = NSData::with_bytes(APP_ICON_PNG);

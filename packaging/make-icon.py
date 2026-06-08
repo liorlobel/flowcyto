@@ -123,6 +123,17 @@ def main():
     arr[..., 3] = mask * 255.0
     out = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), "RGBA")
 
+    # ── macOS app-icon grid: inset the squircle to 824/1024 (~80.5%) with the
+    #    standard transparent margin. The Dock renders an app icon filling its
+    #    image bounds; a full-bleed icon therefore looks oversized (and a running
+    #    app's tile renders slightly larger than its pinned/idle tile, which made
+    #    the size jump visible). The margin makes flowcyto match other apps.
+    CONTENT = 824
+    off = (S - CONTENT) // 2
+    canvas = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    canvas.paste(out.resize((CONTENT, CONTENT), Image.LANCZOS), (off, off))
+    out = canvas
+
     here = os.path.dirname(os.path.abspath(__file__))
     path = os.path.join(here, "icon.png")
     out.save(path)
