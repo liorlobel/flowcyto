@@ -486,7 +486,7 @@ fn cmd_compute_spillover(
     let comp = compute_spillover(&fluor, &unst, &refs)?;
 
     println!("Computed spillover from {} single-stain controls + unstained", controls.len());
-    println!("(all-events median, background-subtracted, row-normalized by primary)\n");
+    println!("(positive-gated median, background-subtracted, row-normalized by primary)\n");
 
     // matrix
     print!("{:<22}", "Source \\ Detector");

@@ -201,30 +201,42 @@ pub fn compute_spillover(
     let mut assigned: Vec<usize> = vec![0; controls.len()];
 
     for (ci, c) in controls.iter().enumerate() {
-        let med = channel_medians(c, fluor_channels)
+        // All-events medians identify which channel this control stains (its brightest
+        // background-subtracted detector) — robust even when only a fraction of the
+        // cells are positive.
+        let all_med = channel_medians(c, fluor_channels)
             .with_context(|| format!("computing medians for control #{}", ci + 1))?;
-        let sig: Vec<f64> = (0..n).map(|j| med[j] - background[j]).collect();
-
-        // primary = brightest background-subtracted channel
-        let p = sig
+        let sig_all: Vec<f64> = (0..n).map(|j| all_med[j] - background[j]).collect();
+        let p = sig_all
             .iter()
             .enumerate()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, _)| i)
             .unwrap();
+        if rows[p].is_some() {
+            bail!(
+                "two controls were both assigned to channel '{}' by intensity — \
+                 check for a duplicate or swapped control file",
+                fluor_channels[p]
+            );
+        }
+
+        // The spillover row is measured over the POSITIVE (stained) population only,
+        // gated on the primary channel's neg/pos density valley. On cell-based controls
+        // (a stained subset over an unstained majority) the all-events median is pulled
+        // toward background and biases the row — most sharply when it shrinks the
+        // primary-channel denominator and inflates every ratio. Positive-gating removes
+        // that bias; it falls back to all events when there is no clear negative
+        // population (e.g. bead controls / fully-stained tubes).
+        let med = positive_gated_medians(c, fluor_channels, p)
+            .with_context(|| format!("positive-gated medians for control #{}", ci + 1))?;
+        let sig: Vec<f64> = (0..n).map(|j| med[j] - background[j]).collect();
         let denom = sig[p];
         if denom <= 0.0 {
             bail!(
                 "control #{} has non-positive signal in its brightest channel '{}' \
                  — is it really a stained control (vs unstained)?",
                 ci + 1, fluor_channels[p]
-            );
-        }
-        if rows[p].is_some() {
-            bail!(
-                "two controls were both assigned to channel '{}' by intensity — \
-                 check for a duplicate or swapped control file",
-                fluor_channels[p]
             );
         }
         rows[p] = Some(sig.iter().map(|&v| v / denom).collect());
@@ -253,6 +265,50 @@ fn channel_medians(fcs: &FcsFile, channels: &[String]) -> Result<Vec<f64>> {
             Ok(median(&vals))
         })
         .collect()
+}
+
+/// Per-channel medians over the **positive (stained) population** of a single-stain
+/// control, gated on its `primary` channel. The neg/pos split is the density valley in
+/// asinh space (`autogate::valley_threshold`); when the control has no clear negative
+/// population (no second peak → no valley) or too few positives, all events are used,
+/// recovering the original all-events behaviour. This de-biases the spillover estimate
+/// on cell-based controls, where the stained cells are a subset of the tube.
+fn positive_gated_medians(fcs: &FcsFile, channels: &[String], primary: usize) -> Result<Vec<f64>> {
+    let cols: Vec<Vec<f64>> = channels
+        .iter()
+        .map(|ch| {
+            let idx = fcs.param_index(ch)
+                .with_context(|| format!("channel '{}' not found in control file", ch))?;
+            Ok(fcs.channel_values(idx))
+        })
+        .collect::<Result<_>>()?;
+
+    // Split on the primary channel in asinh display space, where the negative and
+    // positive peaks separate (a raw-linear histogram squashes the negatives into one
+    // bin and the valley finder can't see two peaks). The cofactor only affects the
+    // split, not the medians (which are taken on the raw values).
+    const COFACTOR: f64 = 150.0;
+    let prim_disp: Vec<f64> = cols[primary].iter().map(|&x| (x / COFACTOR).asinh()).collect();
+    let mask: Vec<bool> = match crate::autogate::valley_threshold(&prim_disp, 128) {
+        Some((thr, _depth)) => prim_disp.iter().map(|&v| v > thr).collect(),
+        None => vec![true; cols[primary].len()],
+    };
+    let n_pos = mask.iter().filter(|&&m| m).count();
+    let use_mask = n_pos >= 50; // enough positives for a stable median, else use all
+
+    Ok(cols
+        .iter()
+        .map(|col| {
+            if use_mask {
+                let sel: Vec<f64> = col.iter().zip(&mask)
+                    .filter_map(|(&v, &m)| m.then_some(v))
+                    .collect();
+                median(&sel)
+            } else {
+                median(col)
+            }
+        })
+        .collect())
 }
 
 /// Longest fluorescence-channel token (channel name minus the "-A" suffix) that is a
@@ -448,6 +504,48 @@ mod tests {
         assert!((res.rows[0][1] - 0.20).abs() < 1e-9);
         assert!((res.rows[1][0] - 0.08).abs() < 1e-9);
         assert!((res.rows[1][1] - 1.0).abs() < 1e-9);
+    }
+
+    /// A cell-style control: a stained POSITIVE subset over an unstained majority, each
+    /// population with spread so the primary channel is bimodal (the valley finder
+    /// fires). Positive-gating must recover the known spillover even though the
+    /// all-events median is pulled toward the unstained background.
+    fn mixed_stain(primary: usize, bg: f64, signal: f64, spill: f64, pos_frac: f64, n: usize) -> FcsFile {
+        let other = 1 - primary;
+        let n_pos = (n as f64 * pos_frac) as usize;
+        let rows: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                let mut e = vec![bg, bg];
+                if i < n_pos {
+                    // ~±30% spread around `signal` → a peak with a defined median;
+                    // spillover stays proportional per event.
+                    let s = signal * (1.0 + 0.06 * ((i % 11) as f64 - 5.0));
+                    e[primary] += s;
+                    e[other] += s * spill;
+                }
+                e
+            })
+            .collect();
+        make_fcs(&["FITC-A", "PE-A"], &rows)
+    }
+
+    #[test]
+    fn compute_spillover_positive_gated_recovers_from_cell_control() {
+        let bg = 200.0;
+        let u: Vec<Vec<f64>> = (0..600).map(|_| vec![bg, bg]).collect();
+        let unstained = make_fcs(&["FITC-A", "PE-A"], &u);
+        // 60% positive in each control; FITC→PE 0.20, PE→FITC 0.08.
+        let fitc = mixed_stain(0, bg, 3000.0, 0.20, 0.60, 600);
+        let pe = mixed_stain(1, bg, 3000.0, 0.08, 0.60, 600);
+        let res = compute_spillover(
+            &["FITC-A".into(), "PE-A".into()],
+            &unstained,
+            &[&fitc, &pe],
+        )
+        .unwrap();
+        assert_eq!(res.assigned, vec![0, 1], "intensity-based assignment");
+        assert!((res.rows[0][1] - 0.20).abs() < 0.02, "FITC→PE recovered, got {}", res.rows[0][1]);
+        assert!((res.rows[1][0] - 0.08).abs() < 0.02, "PE→FITC recovered, got {}", res.rows[1][0]);
     }
 
     #[test]
