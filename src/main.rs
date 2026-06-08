@@ -16,6 +16,7 @@ mod logicle;
 mod popstats;
 mod qc;
 mod r_bridge;
+mod selftest;
 mod stats;
 #[cfg(test)]
 mod test_util;
@@ -64,6 +65,9 @@ enum Command {
 
     /// Check GitHub for a newer release (the only command that touches the network).
     Update,
+
+    /// Verify the numeric layers against frozen flowCore golden values (offline).
+    Selftest,
 
     /// Print per-channel summary statistics.
     Stats {
@@ -220,6 +224,7 @@ fn main() -> Result<()> {
         }
         Command::Info { file } => cmd_info(&file),
         Command::Update => cmd_update(),
+        Command::Selftest => cmd_selftest(),
         Command::Stats { file, compensate, transform, cofactor } =>
             cmd_stats(&file, compensate, &transform, cofactor),
         Command::Export { file, output, compensate, transform, cofactor } =>
@@ -282,6 +287,15 @@ fn cmd_transform_dump(
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────
+
+fn cmd_selftest() -> Result<()> {
+    let results = selftest::run().map_err(|e| anyhow::anyhow!(e))?;
+    if selftest::report(&results) {
+        Ok(())
+    } else {
+        anyhow::bail!("selftest failed — a numeric layer deviates from flowCore");
+    }
+}
 
 fn cmd_update() -> Result<()> {
     match update::check_latest() {

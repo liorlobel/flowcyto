@@ -113,7 +113,25 @@ flowcyto popstats sample.fcs -g gates.json -o csv   # per-population stats → t
 flowcyto gate    sample.fcs -g gates.json           # gate counts
 flowcyto gui     sample.fcs                          # open in the GUI
 flowcyto update                                      # check GitHub for a newer release
+flowcyto selftest                                    # verify the numerics vs flowCore
 ```
+
+### Validated against flowCore — and you can check it yourself
+
+`flowcyto selftest` recomputes parsing, compensation, asinh, and logicle on a bundled
+reference and compares to **frozen R/[flowCore](https://bioconductor.org/packages/flowCore/)
+golden values** — offline, no R needed. It prints a benchmark table and exits non-zero
+on any deviation (it's also part of the test suite, so CI guards it on every change):
+
+```
+Layer                 Probes    Max rel. dev   Tolerance   Result
+Asinh transform           15        4.73e-11        1e-5     PASS
+Compensation             120        4.47e-10        1e-5     PASS
+Logicle transform         15        1.07e-10        1e-5     PASS
+Parsing                  120        3.82e-10        1e-5     PASS
+```
+
+(Regenerate the golden with `validation/gen_golden.R` if you have R + flowCore.)
 
 ## Building from source
 
