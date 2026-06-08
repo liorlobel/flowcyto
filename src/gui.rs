@@ -18,6 +18,7 @@ use crate::compensation::{
 };
 use crate::fcs_write;
 use crate::fcs::FcsFile;
+use crate::qc;
 use crate::gating::{compute_own_masks, effective_mask, BoolOp, Gate, GateShape};
 use crate::popstats::{
     append_long_csv, append_long_csv_grouped, population_stats, PopulationStatsTable,
@@ -35,6 +36,10 @@ const POLY_CLOSE_SQ: f64 = 0.0036; // ~6% of the plot's width/height
 /// stray click-with-jitter doesn't create a tiny accidental gate.
 const MIN_DRAG_SQ: f64 = 0.00035; // ~1.9% of the plot's width/height
 const QC_MIN_EVENTS: usize = 5_000;   // tubes below this are flagged in the Samples list
+const QC_MIN_VIABLE: f64 = 50.0;      // %viable below this is flagged
+const QC_FLOW_DEV: f64 = 40.0;        // flow-rate bin deviation % above this is flagged
+const QC_MARGIN_PCT: f64 = 1.0;       // saturated/margin % above this is flagged
+const QC_FLOW_BINS: usize = 20;       // time bins for the flow-rate check
 const REF_OVERLAY_MAX: usize = 8_000; // points drawn for a reference-overlay sample
 
 /// Compact event count: 141 → "141", 13897 → "13.9k", 354295 → "354.3k".
@@ -42,6 +47,27 @@ fn fmt_count(n: usize) -> String {
     if n >= 1_000_000 { format!("{:.1}M", n as f64 / 1e6) }
     else if n >= 1000 { format!("{:.1}k", n as f64 / 1e3) }
     else { n.to_string() }
+}
+
+/// Tiny inline bar sparkline of per-time-bin event counts — a clog shows as a dip.
+fn flow_sparkline(ui: &mut egui::Ui, bins: &[usize], flagged: bool) -> egui::Response {
+    let (w, h) = (66.0_f32, 16.0_f32);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+    if !bins.is_empty() {
+        let mx = bins.iter().copied().max().unwrap_or(1).max(1) as f32;
+        let bw = w / bins.len() as f32;
+        let col = if flagged { Color32::from_rgb(220, 150, 50) } else { Color32::from_rgb(120, 165, 120) };
+        let p = ui.painter();
+        for (i, &c) in bins.iter().enumerate() {
+            let bh = (c as f32 / mx) * h;
+            let x = rect.left() + i as f32 * bw;
+            p.rect_filled(
+                egui::Rect::from_min_size(egui::pos2(x, rect.bottom() - bh), egui::vec2((bw - 1.0).max(1.0), bh)),
+                0.0, col,
+            );
+        }
+    }
+    resp
 }
 
 // ── Colors ────────────────────────────────────────────────────────────────
@@ -171,7 +197,7 @@ fn gate_color(id: u32) -> (Color32, Color32) {
 enum DrawMode { Navigate, Rect, Ellipse, Polygon, Quadrant, Edit }
 
 #[derive(PartialEq, Clone, Copy)]
-enum ActiveTab { Plot, Histogram, Stats, Batch, Spillover }
+enum ActiveTab { Plot, Histogram, Stats, Batch, Spillover, QC }
 
 #[derive(PartialEq, Clone, Copy)]
 enum BatchMetric { PctParent, PctTotal, Mfi }
@@ -300,6 +326,26 @@ enum BatchMsg {
     Done,
 }
 
+/// One row of the QC scan — per-tube acquisition-quality summary.
+#[derive(Clone)]
+struct QcRow {
+    group: String,
+    name: String,
+    n_events: usize,
+    viable: Option<f64>,              // designated live gate's % of parent (None = not set)
+    flow_dev: Option<f64>,            // flow-rate max deviation %, None = no usable Time
+    flow_bins: Vec<usize>,            // per-bin event counts (sparkline)
+    worst_margin: Option<(String, f64)>, // (channel, % saturated)
+    flags: Vec<String>,              // human-readable reasons, empty = pass
+}
+
+enum QcMsg {
+    Progress { done: usize, total: usize, name: String },
+    Row(Box<QcRow>),
+    Skip(String, String),
+    Done,
+}
+
 pub struct FlowCytoApp {
     fcs: Option<FcsFile>,            // the ACTIVE sample's parsed file
     file_path: Option<PathBuf>,
@@ -317,6 +363,12 @@ pub struct FlowCytoApp {
     batch_rx: Option<Receiver<BatchMsg>>,        // streamed results from the worker thread
     batch_cancel: Option<Arc<AtomicBool>>,       // set to stop the worker early
     batch_progress: Option<(usize, usize)>,      // (done, total) while a batch runs
+    // QC suite — per-tube acquisition quality, streamed like the batch.
+    qc_live_gate: Option<u32>,                   // gate designated as the viability population
+    qc_rows: Vec<QcRow>,
+    qc_rx: Option<Receiver<QcMsg>>,
+    qc_cancel: Option<Arc<AtomicBool>>,
+    qc_progress: Option<(usize, usize)>,
     // Manual update check (the app's only network path; fires only on explicit click).
     update_rx: Option<Receiver<Result<crate::update::UpdateInfo, String>>>,
     update_msg: Option<String>,                  // last update-check result message
@@ -411,6 +463,7 @@ impl Default for FlowCytoApp {
             samples: Vec::new(), active_sample: 0, batch: None, batch_channel: 0,
             batch_plot_pop: None, batch_plot_metric: BatchMetric::PctParent,
             batch_rx: None, batch_cancel: None, batch_progress: None,
+            qc_live_gate: None, qc_rows: Vec::new(), qc_rx: None, qc_cancel: None, qc_progress: None,
             update_rx: None, update_msg: None, update_found: None,
             ref_sample: None, ref_scatter: None,
             do_compensate: false, dark_mode: true,
@@ -940,6 +993,7 @@ impl FlowCytoApp {
         if let Some(p) = self.new_gate_parent { if !self.gates.iter().any(|g| g.id == p) { self.new_gate_parent = None; } }
         if let Some(a) = self.active_pop { if !self.gates.iter().any(|g| g.id == a) { self.active_pop = None; } }
         if let Some(h) = self.hist_sample_pop { if !self.gates.iter().any(|g| g.id == h) { self.hist_sample_pop = None; } }
+        if let Some(q) = self.qc_live_gate { if !self.gates.iter().any(|g| g.id == q) { self.qc_live_gate = None; } }
         self.hist_hidden.retain(|id| self.gates.iter().any(|g| g.id == *id));
         self.scatter = None;
         self.hist_cache = None;
@@ -1223,6 +1277,7 @@ impl eframe::App for FlowCytoApp {
         self.handle_menu_events(ctx);
         self.handle_dropped_files(ctx);
         self.poll_batch(ctx);
+        self.poll_qc(ctx);
         self.poll_updates(ctx);
         self.handle_keys(ctx);
 
@@ -1265,7 +1320,7 @@ impl FlowCytoApp {
         struct Keys {
             undo: bool, redo: bool, save: bool, esc: bool,
             rect: bool, ellipse: bool, poly: bool, quad: bool, edit: bool, nav: bool,
-            tabs: [bool; 5],
+            tabs: [bool; 6],
         }
         let k = ctx.input(|i| {
             let cmd = i.modifiers.command;
@@ -1284,7 +1339,7 @@ impl FlowCytoApp {
                 tabs: [
                     plain && i.key_pressed(Key::Num1), plain && i.key_pressed(Key::Num2),
                     plain && i.key_pressed(Key::Num3), plain && i.key_pressed(Key::Num4),
-                    plain && i.key_pressed(Key::Num5),
+                    plain && i.key_pressed(Key::Num5), plain && i.key_pressed(Key::Num6),
                 ],
             }
         });
@@ -1307,8 +1362,8 @@ impl FlowCytoApp {
             self.drag_start = None; self.drag_current = None; self.poly_vertices.clear();
         }
 
-        const TAB_ORDER: [ActiveTab; 5] = [
-            ActiveTab::Plot, ActiveTab::Histogram, ActiveTab::Stats, ActiveTab::Batch, ActiveTab::Spillover,
+        const TAB_ORDER: [ActiveTab; 6] = [
+            ActiveTab::Plot, ActiveTab::Histogram, ActiveTab::Stats, ActiveTab::Batch, ActiveTab::Spillover, ActiveTab::QC,
         ];
         for (t, &on) in TAB_ORDER.iter().zip(k.tabs.iter()) {
             if on { self.active_tab = *t; }
@@ -1339,8 +1394,8 @@ impl FlowCytoApp {
                 else if let Some(i) = st.tabs.iter().position(|t| *t == id) { acts.push(A::Tab(i)); }
             }
         }
-        const TABS: [ActiveTab; 5] = [
-            ActiveTab::Plot, ActiveTab::Histogram, ActiveTab::Stats, ActiveTab::Batch, ActiveTab::Spillover,
+        const TABS: [ActiveTab; 6] = [
+            ActiveTab::Plot, ActiveTab::Histogram, ActiveTab::Stats, ActiveTab::Batch, ActiveTab::Spillover, ActiveTab::QC,
         ];
         for a in acts {
             match a {
@@ -1414,6 +1469,7 @@ impl FlowCytoApp {
                 ui.selectable_value(&mut self.active_tab, ActiveTab::Stats, format!("{} Stats", icon::TABLE));
                 ui.selectable_value(&mut self.active_tab, ActiveTab::Batch, format!("{} Batch", icon::STACK));
                 ui.selectable_value(&mut self.active_tab, ActiveTab::Spillover, format!("{} Spillover", icon::GRID_NINE));
+                ui.selectable_value(&mut self.active_tab, ActiveTab::QC, format!("{} QC", icon::HEARTBEAT));
 
                 // Right-aligned: manual update check (the app's only network call).
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1950,6 +2006,7 @@ impl FlowCytoApp {
             self.bool_refs.remove(&gid);
             if self.new_gate_parent == Some(gid) { self.new_gate_parent = parent_of; }
             if self.hist_sample_pop == Some(gid) { self.hist_sample_pop = None; self.hist_cache = None; }
+            if self.qc_live_gate == Some(gid) { self.qc_live_gate = None; }
             if self.selected_gate == Some(gid) { self.selected_gate = None; }
             if self.active_pop == Some(gid) { self.active_pop = parent_of; self.scatter = None; }
             self.hist_hidden.remove(&gid);
@@ -2132,6 +2189,7 @@ impl FlowCytoApp {
         // Reconcile gate-id-keyed UI state against the loaded gates so a stale id can't
         // dangle (effective_mask of an unknown id returns all-true → wrong histogram).
         if let Some(h) = self.hist_sample_pop { if !self.gates.iter().any(|g| g.id == h) { self.hist_sample_pop = None; } }
+        if let Some(q) = self.qc_live_gate { if !self.gates.iter().any(|g| g.id == q) { self.qc_live_gate = None; } }
         self.hist_hidden.retain(|id| self.gates.iter().any(|g| g.id == *id));
         self.scatter_hidden.retain(|id| self.gates.iter().any(|g| g.id == *id));
         self.bool_refs.retain(|id| self.gates.iter().any(|g| g.id == *id));
@@ -2185,6 +2243,7 @@ impl FlowCytoApp {
                 ActiveTab::Stats => self.stats_table(ui),
                 ActiveTab::Batch => self.batch_view(ui),
                 ActiveTab::Spillover => self.spillover_view(ui),
+                ActiveTab::QC => self.qc_view(ui),
             }
         });
     }
@@ -3450,6 +3509,235 @@ impl FlowCytoApp {
         }
     }
 
+    // ── QC suite ──────────────────────────────────────────────────────
+
+    /// Stream an acquisition-QC pass over every workspace sample (open → metrics →
+    /// drop, on a worker thread, same pattern as the batch). Per tube: event count,
+    /// %viable (the designated live gate's % of parent, via the validated gating
+    /// engine), flow-rate stability (clog detection on the Time channel), and
+    /// margin/saturation events.
+    fn run_qc(&mut self) {
+        if self.samples.is_empty() {
+            self.status = "No samples to QC.".into();
+            return;
+        }
+        self.cancel_qc();
+        let samples: Vec<(PathBuf, String, String)> = self.samples.iter()
+            .map(|s| (s.path.clone(), s.name.clone(), s.group.clone())).collect();
+        let total = samples.len();
+        let gates = self.gates.clone();
+        let do_comp = self.do_compensate;
+        let ov = self.spill_override.clone();
+        let live = self.qc_live_gate;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cw = cancel.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<QcMsg>();
+        std::thread::spawn(move || {
+            for (i, (path, name, group)) in samples.into_iter().enumerate() {
+                if cw.load(Ordering::Relaxed) { break; }
+                let _ = tx.send(QcMsg::Progress { done: i, total, name: name.clone() });
+                let fcs = match FcsFile::open(&path) {
+                    Ok(f) => f,
+                    Err(e) => { let _ = tx.send(QcMsg::Skip(name, e.to_string())); continue; }
+                };
+                // Margin/saturation on RAW data (the acquisition range).
+                let worst_margin = qc::worst_margin(&qc::margin_events(&fcs.events, &fcs.parameters, fcs.n_events));
+                // Flow-rate on the Time channel (None if absent/constant).
+                let flow = fcs.param_index("Time")
+                    .map(|ti| fcs.channel_values(ti))
+                    .and_then(|t| qc::flow_rate(&t, QC_FLOW_BINS, QC_FLOW_DEV));
+                // %viable: the designated gate's effective count / its parent's.
+                let viable = live.and_then(|gid| {
+                    let events = compensate_for(&fcs, do_comp, ov.as_ref()).ok()?;
+                    let own = compute_own_masks(&gates, &events, &fcs.parameters, fcs.n_events);
+                    let by_id: HashMap<u32, &Gate> = gates.iter().map(|g| (g.id, g)).collect();
+                    let g = by_id.get(&gid)?;
+                    let count = |id: u32| effective_mask(id, &by_id, &own, fcs.n_events).iter().filter(|&&b| b).count();
+                    let cnt = count(gid);
+                    let par = match g.parent { Some(p) => count(p), None => fcs.n_events };
+                    Some(if par > 0 { 100.0 * cnt as f64 / par as f64 } else { 0.0 })
+                });
+                let mut flags = Vec::new();
+                if fcs.n_events < QC_MIN_EVENTS { flags.push(format!("low events ({})", fcs.n_events)); }
+                if let Some(v) = viable { if v < QC_MIN_VIABLE { flags.push(format!("low viability ({:.0}%)", v)); } }
+                if let Some(fr) = &flow { if fr.flagged { flags.push(format!("flow-rate Δ{:.0}%", fr.max_dev_pct)); } }
+                if let Some((ch, m)) = &worst_margin { if *m > QC_MARGIN_PCT { flags.push(format!("{:.1}% off-scale on {}", m, ch)); } }
+                let row = QcRow {
+                    group, name, n_events: fcs.n_events, viable,
+                    flow_dev: flow.as_ref().map(|f| f.max_dev_pct),
+                    flow_bins: flow.map(|f| f.bins).unwrap_or_default(),
+                    worst_margin, flags,
+                };
+                let _ = tx.send(QcMsg::Row(Box::new(row)));
+            }
+            let _ = tx.send(QcMsg::Done);
+        });
+        self.qc_rows.clear();
+        self.qc_rx = Some(rx);
+        self.qc_cancel = Some(cancel);
+        self.qc_progress = Some((0, total));
+        self.status = format!("QC scan started: 0/{}", total);
+    }
+
+    fn cancel_qc(&mut self) {
+        if let Some(c) = &self.qc_cancel { c.store(true, Ordering::Relaxed); }
+        self.qc_rx = None; self.qc_cancel = None; self.qc_progress = None;
+    }
+
+    /// Drain QC results each frame while a scan runs (mirrors poll_batch, incl. the
+    /// disconnect-without-Done = worker-panic detection).
+    fn poll_qc(&mut self, ctx: &egui::Context) {
+        if self.qc_rx.is_none() { return; }
+        let mut msgs: Vec<QcMsg> = Vec::new();
+        let mut disconnected = false;
+        if let Some(rx) = &self.qc_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(m) => msgs.push(m),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => { disconnected = true; break; }
+                }
+            }
+        }
+        let mut got_done = false;
+        for m in msgs {
+            match m {
+                QcMsg::Progress { done, total, name } => {
+                    self.qc_progress = Some((done, total));
+                    self.status = format!("QC {}/{}: {}", done, total, name);
+                }
+                QcMsg::Row(r) => self.qc_rows.push(*r),
+                QcMsg::Skip(s, reason) => self.qc_rows.push(QcRow {
+                    group: String::new(), name: s, n_events: 0, viable: None, flow_dev: None,
+                    flow_bins: Vec::new(), worst_margin: None, flags: vec![format!("skipped: {}", reason)],
+                }),
+                QcMsg::Done => got_done = true,
+            }
+        }
+        if got_done || disconnected {
+            let n = self.qc_rows.len();
+            let bad = self.qc_rows.iter().filter(|r| !r.flags.is_empty()).count();
+            self.qc_rx = None; self.qc_cancel = None; self.qc_progress = None;
+            self.status = if got_done {
+                format!("QC done: {} tube(s), {} flagged", n, bad)
+            } else {
+                format!("{} QC ended early — a sample may have failed", icon::WARNING)
+            };
+        } else {
+            ctx.request_repaint();
+        }
+    }
+
+    fn qc_view(&mut self, ui: &mut egui::Ui) {
+        ui.heading(format!("{} Acquisition QC", icon::HEARTBEAT));
+        if self.samples.is_empty() {
+            ui.label(RichText::new("Open one or more FCS files, then run a QC scan.").color(Color32::GRAY));
+            return;
+        }
+        let running = self.qc_rx.is_some();
+        ui.horizontal(|ui| {
+            ui.label("Viability gate:");
+            let cur = self.qc_live_gate
+                .and_then(|id| self.gates.iter().find(|g| g.id == id))
+                .map(|g| g.name.clone()).unwrap_or_else(|| "(none)".into());
+            egui::ComboBox::from_id_salt("qc_live").selected_text(cur).show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.qc_live_gate, None, "(none)");
+                let gates: Vec<(u32, String)> = self.gates.iter().map(|g| (g.id, g.name.clone())).collect();
+                for (id, name) in gates { ui.selectable_value(&mut self.qc_live_gate, Some(id), name); }
+            });
+            ui.separator();
+            if running {
+                ui.add(egui::Spinner::new());
+                if let Some((d, t)) = self.qc_progress { ui.label(format!("{}/{}", d, t)); }
+                if ui.button(format!("{} Cancel", icon::X)).clicked() { self.cancel_qc(); }
+            } else {
+                if ui.button(format!("{} Run QC scan", icon::HEARTBEAT)).clicked() { self.run_qc(); }
+                if !self.qc_rows.is_empty() && ui.button(format!("{} Export CSV", icon::EXPORT)).clicked() {
+                    self.export_qc_csv();
+                }
+            }
+        });
+        ui.label(RichText::new(format!(
+            "Flags: events <{} · viability <{:.0}% · flow-rate Δ>{:.0}% (clog) · off-scale >{:.0}%. \
+             Pick a live/viable gate above for %viable.",
+            QC_MIN_EVENTS, QC_MIN_VIABLE, QC_FLOW_DEV, QC_MARGIN_PCT)).small().weak());
+        ui.separator();
+        if self.qc_rows.is_empty() {
+            ui.label(RichText::new("Run a scan to see per-tube quality.").color(Color32::GRAY));
+            return;
+        }
+        let amber = Color32::from_rgb(220, 150, 50);
+        let green = Color32::from_rgb(90, 180, 90);
+        TableBuilder::new(ui).striped(true)
+            .column(Column::auto().at_least(150.0))
+            .column(Column::auto().at_least(64.0))
+            .column(Column::auto().at_least(64.0))
+            .column(Column::auto().at_least(74.0))
+            .column(Column::auto().at_least(80.0))
+            .column(Column::remainder().at_least(160.0))
+            .header(20.0, |mut h| {
+                for t in ["Sample", "Events", "%Viable", "Flow", "Off-scale", "Status"] {
+                    h.col(|ui| { ui.strong(t); });
+                }
+            })
+            .body(|mut body| {
+                for r in &self.qc_rows {
+                    body.row(20.0, |mut row| {
+                        let bad = !r.flags.is_empty();
+                        row.col(|ui| { ui.label(&r.name); });
+                        row.col(|ui| {
+                            let t = RichText::new(fmt_count(r.n_events));
+                            ui.label(if r.n_events < QC_MIN_EVENTS { t.color(amber) } else { t });
+                        });
+                        row.col(|ui| {
+                            ui.label(r.viable.map(|v| format!("{:.1}%", v)).unwrap_or_else(|| "—".into()));
+                        });
+                        row.col(|ui| {
+                            if r.flow_bins.is_empty() {
+                                ui.label(RichText::new("n/a").weak()).on_hover_text("no usable Time channel");
+                            } else {
+                                let flagged = r.flow_dev.map(|d| d > QC_FLOW_DEV).unwrap_or(false);
+                                flow_sparkline(ui, &r.flow_bins, flagged).on_hover_text(format!(
+                                    "flow-rate Δ {:.0}% over {} time bins (a dip = clog)",
+                                    r.flow_dev.unwrap_or(0.0), r.flow_bins.len()));
+                            }
+                        });
+                        row.col(|ui| {
+                            ui.label(r.worst_margin.as_ref().map(|(_, m)| format!("{:.1}%", m)).unwrap_or_else(|| "—".into()));
+                        });
+                        row.col(|ui| {
+                            if bad {
+                                ui.label(RichText::new(format!("{} {}", icon::WARNING, r.flags.join("; "))).color(amber));
+                            } else {
+                                ui.label(RichText::new(format!("{} pass", icon::CHECK)).color(green));
+                            }
+                        });
+                    });
+                }
+            });
+    }
+
+    fn export_qc_csv(&mut self) {
+        let Some(path) = rfd::FileDialog::new().add_filter("CSV", &["csv"])
+            .set_file_name("qc.csv").save_file() else { return; };
+        let esc = |x: &str| if x.contains(',') || x.contains('"') {
+            format!("\"{}\"", x.replace('"', "\"\""))
+        } else { x.to_string() };
+        let mut s = String::from("group,sample,events,pct_viable,flow_dev_pct,offscale_pct,offscale_channel,flags\n");
+        for r in &self.qc_rows {
+            let v = r.viable.map(|v| format!("{:.2}", v)).unwrap_or_default();
+            let fd = r.flow_dev.map(|d| format!("{:.2}", d)).unwrap_or_default();
+            let (mc, mp) = r.worst_margin.clone()
+                .map(|(c, m)| (c, format!("{:.2}", m))).unwrap_or_default();
+            s.push_str(&format!("{},{},{},{},{},{},{},{}\n",
+                esc(&r.group), esc(&r.name), r.n_events, v, fd, mp, esc(&mc), esc(&r.flags.join("; "))));
+        }
+        match std::fs::write(&path, s) {
+            Ok(_) => self.status = format!("Wrote QC table → {}", path.display()),
+            Err(e) => self.status = format!("QC export error: {}", e),
+        }
+    }
+
     // ── Batch ─────────────────────────────────────────────────────────
 
     /// Start a background batch over every workspace sample. Each file is loaded,
@@ -4602,7 +4890,7 @@ struct MenuState {
     zoom_in: muda::MenuId,
     zoom_out: muda::MenuId,
     zoom_reset: muda::MenuId,
-    tabs: [muda::MenuId; 5], // Plot, Histogram, Stats, Batch, Spillover
+    tabs: [muda::MenuId; 6], // Plot, Histogram, Stats, Batch, Spillover, QC
 }
 
 #[cfg(target_os = "macos")]
@@ -4646,7 +4934,7 @@ fn build_menu() -> MenuState {
 
     // View (tab switches + theme).
     let view_m = Submenu::new("View", true);
-    let names = ["Plot", "Histogram", "Stats", "Batch", "Spillover"];
+    let names = ["Plot", "Histogram", "Stats", "Batch", "Spillover", "QC"];
     let tab_items: Vec<MenuItem> = names.iter().enumerate()
         .map(|(i, n)| MenuItem::new(*n, true, acc(&format!("CmdOrCtrl+{}", i + 1)))).collect();
     let theme = MenuItem::new("Toggle Light/Dark", true, None);

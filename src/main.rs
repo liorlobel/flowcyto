@@ -13,6 +13,7 @@ mod gating;
 mod gui;
 mod logicle;
 mod popstats;
+mod qc;
 mod stats;
 #[cfg(test)]
 mod test_util;

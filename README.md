@@ -66,6 +66,12 @@ toolbar's **🖫 Save session** stores everything — samples, gates, transforms
 compensation — to reopen later.
 
 ### Handy extras
+- **QC** tab: a per-tube acquisition-quality scan across the whole workspace —
+  event count, **%viable** (pick any gate as the live/viable population; its % of
+  parent comes from the same validated gating engine), **flow-rate stability**
+  (a clog/bubble shows as a dip in the per-tube event-rate sparkline), and
+  **off-scale/saturation** events. Flagged tubes are highlighted; export the table
+  as CSV.
 - **Histogram** tab: 1-D overlays of populations or samples; drag to add an
   interval gate.
 - **Spillover** tab: view/edit the compensation matrix, or compute one from
