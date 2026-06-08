@@ -5386,6 +5386,21 @@ fn themed_visuals(dark: bool) -> egui::Visuals {
     v
 }
 
+/// The application icon, embedded once and shared by every platform's icon path
+/// (the eframe window icon below + the macOS Dock setter). Same source PNG the
+/// `.app` bundle's `.icns` and the Windows `.exe` resource are generated from.
+const APP_ICON_PNG: &[u8] = include_bytes!("../packaging/icon.png");
+
+/// Decode the embedded icon into eframe's `IconData` for the window/taskbar icon.
+/// Used by winit's `with_icon` (effective on **Windows** and Linux/X11; a no-op on
+/// macOS, where `set_dock_icon` handles it). Returns `None` if decoding fails so a
+/// bad icon never blocks the GUI.
+fn app_icon() -> Option<egui::IconData> {
+    let img = image::load_from_memory(APP_ICON_PNG).ok()?.to_rgba8();
+    let (width, height) = img.dimensions();
+    Some(egui::IconData { rgba: img.into_raw(), width, height })
+}
+
 /// Set the macOS Dock / application icon at runtime from the embedded PNG.
 ///
 /// winit does not support setting the dock icon on macOS (`with_icon` is a no-op
@@ -5394,20 +5409,18 @@ fn themed_visuals(dark: bool) -> egui::Visuals {
 /// shows a generic icon. `NSApplication setApplicationIconImage:` fixes both: it
 /// applies to the bare binary and harmlessly re-asserts the bundle's icon.
 ///
-/// Called from `run_native`'s creation closure, which already runs on the main
-/// thread (winit has created the `NSApplication` by then). Every step is guarded
-/// and bails silently on failure — a missing icon must never panic the GUI.
+/// Called from `update()` (not the `run_native` closure — a closure-time set is
+/// clobbered when eframe finishes launching and macOS installs the default icon).
+/// Every step is guarded and bails silently on failure — a missing icon must never
+/// panic the GUI.
 #[cfg(target_os = "macos")]
 fn set_dock_icon() {
     use objc2::ClassType; // brings `alloc` into scope
     use objc2_app_kit::{NSApplication, NSImage};
     use objc2_foundation::{MainThreadMarker, NSData};
 
-    // Same source PNG the .app bundle's .icns is generated from; NSImage decodes it.
-    const ICON_PNG: &[u8] = include_bytes!("../packaging/icon.png");
-
     let Some(mtm) = MainThreadMarker::new() else { return };
-    let data = NSData::with_bytes(ICON_PNG);
+    let data = NSData::with_bytes(APP_ICON_PNG);
     let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) else { return };
     let app = NSApplication::sharedApplication(mtm);
     // SAFETY: called on the main thread with a valid NSImage we just constructed;
@@ -5416,11 +5429,16 @@ fn set_dock_icon() {
 }
 
 pub fn run_gui(initial_file: Option<&Path>) {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1500.0_f32, 950.0_f32]).with_title("flowcyto"),
-        ..Default::default()
-    };
+    // Window/taskbar icon: effective on Windows + Linux/X11. On Windows this sets it
+    // via WM_SETICON, independent of the .exe's embedded resource icon (which winit
+    // does not install on its window class — it registers with hIcon = 0). No-op on
+    // macOS; `set_dock_icon` covers that from `update()`.
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1500.0_f32, 950.0_f32]).with_title("flowcyto");
+    if let Some(icon) = app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native("flowcyto", options, Box::new(|cc| {
         setup_fonts(&cc.egui_ctx);
         setup_style(&cc.egui_ctx);
