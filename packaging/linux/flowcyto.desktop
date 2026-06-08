@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=flowcyto
+GenericName=Flow Cytometry Analyzer
+Comment=Analyze BD flow cytometry (.fcs) files — compensation, gating, statistics
+Exec=flowcyto gui %f
+Icon=flowcyto
+Terminal=false
+Categories=Science;Biology;Education;
+Keywords=FCS;flow;cytometry;gating;compensation;MFI;
+StartupWMClass=flowcyto
+StartupNotify=true

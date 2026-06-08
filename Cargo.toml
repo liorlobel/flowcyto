@@ -44,3 +44,33 @@ windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
+
+# ── Debian/Ubuntu package (`cargo deb`) ───────────────────────────────────────
+# Builds a .deb installing the binary, a .desktop launcher, and hicolor icons.
+# `$auto` lets dpkg-shlibdeps detect linked libs; libgl1/libxkbcommon0 are added
+# explicitly because winit/glow load them via dlopen (so they're not in the ELF
+# NEEDED list dpkg-shlibdeps scans). The file-open/save dialogs use the XDG
+# desktop portal (rfd's default backend), hence the xdg-desktop-portal recommend.
+[package.metadata.deb]
+maintainer = "Lior Lobel <lior@llobel.online>"
+copyright = "2026 Lior Lobel"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+A native cross-platform analyzer for BD flow cytometry .fcs files: compensation, \
+asinh/logicle transforms, hierarchical gating, per-population statistics, QC, and \
+a self-contained reproducibility report. Every numeric layer is validated against \
+R/flowCore via a one-command benchmark (`flowcyto selftest`)."""
+section = "science"
+priority = "optional"
+depends = "$auto, libgl1, libxkbcommon0"
+recommends = "xdg-desktop-portal"
+assets = [
+    ["target/release/flowcyto", "usr/bin/", "755"],
+    ["packaging/linux/flowcyto.desktop", "usr/share/applications/", "644"],
+    ["packaging/linux/icons/32x32/flowcyto.png",   "usr/share/icons/hicolor/32x32/apps/flowcyto.png",   "644"],
+    ["packaging/linux/icons/48x48/flowcyto.png",   "usr/share/icons/hicolor/48x48/apps/flowcyto.png",   "644"],
+    ["packaging/linux/icons/64x64/flowcyto.png",   "usr/share/icons/hicolor/64x64/apps/flowcyto.png",   "644"],
+    ["packaging/linux/icons/128x128/flowcyto.png", "usr/share/icons/hicolor/128x128/apps/flowcyto.png", "644"],
+    ["packaging/linux/icons/256x256/flowcyto.png", "usr/share/icons/hicolor/256x256/apps/flowcyto.png", "644"],
+    ["packaging/linux/icons/512x512/flowcyto.png", "usr/share/icons/hicolor/512x512/apps/flowcyto.png", "644"],
+]

@@ -5434,7 +5434,11 @@ pub fn run_gui(initial_file: Option<&Path>) {
     // does not install on its window class — it registers with hIcon = 0). No-op on
     // macOS; `set_dock_icon` covers that from `update()`.
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1500.0_f32, 950.0_f32]).with_title("flowcyto");
+        .with_inner_size([1500.0_f32, 950.0_f32]).with_title("flowcyto")
+        // app_id = the Wayland app_id / X11 WM_CLASS. Matching the installed
+        // `flowcyto.desktop` basename lets the compositor pick up the taskbar icon
+        // on Wayland (where `with_icon` is a no-op, like macOS).
+        .with_app_id("flowcyto");
     if let Some(icon) = app_icon() {
         viewport = viewport.with_icon(icon);
     }

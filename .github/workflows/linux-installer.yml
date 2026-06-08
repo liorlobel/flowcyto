@@ -1,0 +1,91 @@
+name: Linux installer
+
+# Builds a Debian/Ubuntu .deb (cargo-deb) and a universal AppImage (linuxdeploy)
+# on an Ubuntu 22.04 runner — pinned to 22.04 (not -latest) so the binary links an
+# older glibc and runs on a wide range of distros. Gates on clippy + tests, then
+# smoke-tests both packages headlessly via the CLI `selftest`/`info` subcommands
+# (no GUI/GL needed). Runs on version tags (attaching artifacts to that release)
+# and on manual dispatch (artifact only).
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Install build dependencies
+        # winit/glow load X11/Wayland/libGL via dlopen, and rfd uses the XDG portal
+        # (no GTK), so the build needs little beyond libxkbcommon's headers.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --release --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Build .deb (cargo-deb)
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb --no-build
+
+      - name: Build AppImage
+        run: ./packaging/make-appimage.sh
+
+      - name: Smoke-test the .deb (install + run CLI)
+        run: |
+          sudo apt-get install -y ./target/debian/*.deb
+          flowcyto selftest
+          flowcyto info tests/fixtures/tiny.fcs
+
+      - name: Smoke-test the AppImage (run CLI)
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+        run: |
+          chmod +x dist/flowcyto-*.AppImage
+          ./dist/flowcyto-*.AppImage selftest
+
+      - name: Lint the .deb (non-blocking)
+        run: |
+          sudo apt-get install -y lintian
+          lintian target/debian/*.deb || true
+
+      - name: Read version from Cargo.toml
+        id: ver
+        run: echo "version=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*\"([^\"]+)\".*/\1/')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: flowcyto-${{ steps.ver.outputs.version }}-linux
+          path: |
+            target/debian/*.deb
+            dist/flowcyto-*.AppImage
+          if-no-files-found: error
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          gh release view "$tag" >/dev/null 2>&1 || gh release create "$tag" --title "flowcyto $tag" --generate-notes
+          gh release upload "$tag" target/debian/*.deb dist/flowcyto-*.AppImage --clobber
