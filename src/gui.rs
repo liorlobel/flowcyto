@@ -3963,11 +3963,45 @@ impl FlowCytoApp {
         }
     }
 
+    /// Export the tidy popstats CSV **plus** a companion starter `.R` script wired to
+    /// the group/condition tags — so the analysis bridges straight into R.
+    fn export_r_bundle(&mut self) {
+        let (csv, groups, pops) = match &self.batch {
+            Some(b) if !b.tables.is_empty() => {
+                let mut csv = String::new();
+                csv.push_str(LONG_CSV_HEADER_GROUPED);
+                csv.push('\n');
+                let mut groups: Vec<String> = Vec::new();
+                for (g, s, t) in &b.tables {
+                    append_long_csv_grouped(&mut csv, g, s, t);
+                    if !g.is_empty() && !groups.contains(g) { groups.push(g.clone()); }
+                }
+                let pops: Vec<String> = b.tables.first()
+                    .map(|(_, _, t)| t.rows.iter().map(|r| r.name.clone()).collect())
+                    .unwrap_or_default();
+                (csv, groups, pops)
+            }
+            _ => { self.status = "Run a batch first, then export the R bundle.".into(); return; }
+        };
+        let Some(path) = rfd::FileDialog::new().add_filter("CSV", &["csv"])
+            .set_file_name("flowcyto_popstats.csv").save_file() else { return; };
+        let csv_name = path.file_name().map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "popstats.csv".into());
+        let r_path = path.with_extension("R");
+        let r = crate::r_bridge::r_script(&csv_name, &groups, &pops, env!("CARGO_PKG_VERSION"));
+        self.status = match std::fs::write(&path, csv).and_then(|_| std::fs::write(&r_path, r)) {
+            Ok(_) => format!("Wrote {} + {}", csv_name,
+                r_path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()),
+            Err(e) => format!("R bundle export error: {}", e),
+        };
+    }
+
     fn batch_view(&mut self, ui: &mut egui::Ui) {
         let mut do_run = false;
         let mut do_export = false;
         let mut do_copy = false;
         let mut do_cancel = false;
+        let mut do_r = false;
         let running = self.batch_rx.is_some();
         ui.horizontal(|ui| {
             ui.heading("Batch");
@@ -3975,6 +4009,7 @@ impl FlowCytoApp {
             if running && ui.button(format!("{} Cancel", icon::X)).clicked() { do_cancel = true; }
             if self.batch.is_some() && !running && ui.button(format!("{} Export combined CSV", icon::EXPORT)).clicked() { do_export = true; }
             if self.batch.is_some() && !running && ui.button(format!("{} Copy (TSV)", icon::COPY)).on_hover_text("Copy the visible table as tab-separated text").clicked() { do_copy = true; }
+            if self.batch.is_some() && !running && ui.button(format!("{} R bundle", icon::EXPORT)).on_hover_text("Export the tidy CSV + a starter .R analysis script wired to your group tags").clicked() { do_r = true; }
         });
         ui.label(RichText::new(format!(
             "{} samples · {} gates · streamed on a worker thread (UI stays responsive)", self.samples.len(), self.gates.len()
@@ -3989,6 +4024,7 @@ impl FlowCytoApp {
         if do_run { self.run_batch(); }
         if do_cancel { self.cancel_batch(); self.status = "Batch cancelled.".into(); }
         if do_export { self.export_batch_csv(); }
+        if do_r { self.export_r_bundle(); }
 
         // Clone display data out of the batch borrow. Each row carries its OWN
         // table's channel list so the MFI is looked up by NAME (panels may differ

@@ -66,6 +66,12 @@ toolbar's **🖫 Save session** stores everything — samples, gates, transforms
 compensation — to reopen later.
 
 ### Handy extras
+- **R bridge** (Batch tab → **R bundle**): exports the tidy per-population CSV
+  **plus** a ready-to-run starter `.R` (base R, no packages) wired to your
+  group/condition tags — reads the CSV, reshapes to population frequencies,
+  summarizes and plots by group, and scaffolds a comparison with the right
+  flow-cytometry caveats (the tube is the unit of replication, block by
+  experiment, mind rare populations and multiple comparisons).
 - **Auto-gate suggestions** (in the Gates panel — starting points you review):
   **Suggest singlets** fits a diagonal FSC-A × FSC-H band, and **Auto-threshold X**
   splits the current channel at its density valley (handles a small/rare positive

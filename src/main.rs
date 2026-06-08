@@ -15,6 +15,7 @@ mod gui;
 mod logicle;
 mod popstats;
 mod qc;
+mod r_bridge;
 mod stats;
 #[cfg(test)]
 mod test_util;
