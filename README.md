@@ -66,6 +66,11 @@ toolbar's **🖫 Save session** stores everything — samples, gates, transforms
 compensation — to reopen later.
 
 ### Handy extras
+- **Reproducibility report** (toolbar → **Report**): one self-contained `.html`
+  capturing the full provenance of an analysis — file + instrument, the
+  compensation matrix and its source, display transforms, the gating strategy,
+  per-population statistics, and the gate JSON for re-import. Drop it into a
+  paper's supplement so a result is reproducible.
 - **R bridge** (Batch tab → **R bundle**): exports the tidy per-population CSV
   **plus** a ready-to-run starter `.R` (base R, no packages) wired to your
   group/condition tags — reads the CSV, reshapes to population frequencies,

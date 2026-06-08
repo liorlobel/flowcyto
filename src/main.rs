@@ -16,6 +16,7 @@ mod logicle;
 mod popstats;
 mod qc;
 mod r_bridge;
+mod report;
 mod selftest;
 mod stats;
 #[cfg(test)]

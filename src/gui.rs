@@ -1542,6 +1542,7 @@ impl FlowCytoApp {
                     self.save_session();
                 }
                 if ui.button(format!("{} Load session", icon::FOLDER_OPEN)).clicked() { self.load_session(); }
+                if ui.button(format!("{} Report", icon::FILE_TEXT)).on_hover_text("Export a self-contained HTML reproducibility report (provenance + gates + stats)").clicked() { self.export_report(); }
                 ui.separator();
                 if ui.checkbox(&mut self.do_compensate, "Compensate").changed() {
                     self.needs_reprocess = true;
@@ -3996,6 +3997,91 @@ impl FlowCytoApp {
         };
     }
 
+    /// Gather the current analysis into a provenance bundle for the HTML report.
+    fn build_report_data(&self) -> Option<crate::report::ReportData> {
+        use crate::report::{ChannelRow, GateRow, ReportData};
+        let fcs = self.fcs.as_ref()?;
+        let np = fcs.n_params();
+        let kwv = |k: &str| fcs.keywords.get(k).filter(|v| !v.is_empty()).cloned();
+        let file_name = self.samples.get(self.active_sample)
+            .map(|s| s.path.file_name().map(|x| x.to_string_lossy().to_string())
+                .unwrap_or_else(|| format!("{}.fcs", s.name)))
+            .unwrap_or_else(|| "sample.fcs".into());
+        let cytometer = kwv("$CYT").or_else(|| kwv("$CYTOMETER")).unwrap_or_else(|| "—".into());
+        let acq_date = kwv("$DATE").unwrap_or_else(|| "—".into());
+
+        let channels: Vec<ChannelRow> = fcs.parameters.iter().enumerate().map(|(i, p)| ChannelRow {
+            name: p.name.clone(),
+            stain: p.label.clone().filter(|l| !l.is_empty()).unwrap_or_else(|| "—".into()),
+            transform: describe_tf(&self.cur_tf(i)),
+        }).collect();
+
+        let (mut spill_channels, mut spill_rows, mut spill_source) = (Vec::new(), Vec::new(), String::new());
+        if self.do_compensate {
+            if let Some(ov) = &self.spill_override {
+                spill_channels = ov.channels.clone();
+                spill_rows = ov.rows.clone();
+                spill_source = "manual override".into();
+            } else if let Some(kw) = fcs.spillover_keyword() {
+                if let Ok((ch, rows)) = crate::compensation::parse_spillover(kw) {
+                    spill_channels = ch;
+                    spill_rows = rows;
+                    let creator = ["CREATOR", "$CREATOR", "APPLICATION"].iter().find_map(|&k| kwv(k));
+                    let mut prov: Vec<String> = creator.into_iter().collect();
+                    if let Some(c) = kwv("$CYT").or_else(|| kwv("$CYTOMETER")) { prov.push(c); }
+                    if let Some(d) = kwv("$DATE") { prov.push(d); }
+                    spill_source = if prov.is_empty() { "embedded $SPILLOVER".into() }
+                        else { format!("embedded $SPILLOVER ({})", prov.join(" · ")) };
+                }
+            }
+        }
+
+        let mut gates = Vec::new();
+        for (gid, depth) in crate::gating::gate_tree_order(&self.gates) {
+            if let Some(g) = self.gates.iter().find(|x| x.id == gid) {
+                let parent = g.parent.and_then(|p| self.gates.iter().find(|x| x.id == p))
+                    .map(|x| x.name.clone()).unwrap_or_else(|| "All events".into());
+                let channels = match &g.shape {
+                    GateShape::Boolean { .. } => "—".into(),
+                    GateShape::Range { .. } => format!("{} ({})", g.x_channel, g.x_transform.short_label()),
+                    _ => format!("{} ({}) × {} ({})", g.x_channel, g.x_transform.short_label(),
+                                 g.y_channel, g.y_transform.short_label()),
+                };
+                gates.push(GateRow { depth, name: g.name.clone(), parent, channels, shape: shape_desc(&g.shape) });
+            }
+        }
+
+        let stats = if self.compensated.len() >= fcs.n_events * np {
+            let stat_channels: Vec<usize> = fcs.parameters.iter().enumerate()
+                .filter(|(_, p)| !p.name.eq_ignore_ascii_case("Time")).map(|(i, _)| i).collect();
+            Some(population_stats(&self.compensated, &fcs.parameters, fcs.n_events, &self.gates, &stat_channels))
+        } else { None };
+
+        Some(ReportData {
+            version: env!("CARGO_PKG_VERSION").into(),
+            generated: crate::report::now_utc(),
+            file_name, n_events: fcs.n_events, cytometer, acq_date,
+            channels, compensated: self.do_compensate, spill_channels, spill_rows, spill_source,
+            gates, stats,
+            gates_json: serde_json::to_string_pretty(&self.gates).unwrap_or_default(),
+        })
+    }
+
+    /// Write a self-contained HTML reproducibility report and open it in the browser.
+    fn export_report(&mut self) {
+        let data = match self.build_report_data() {
+            Some(d) => d,
+            None => { self.status = "Open a file first.".into(); return; }
+        };
+        let html = crate::report::html(&data);
+        let Some(path) = rfd::FileDialog::new().add_filter("HTML", &["html"])
+            .set_file_name("flowcyto_report.html").save_file() else { return; };
+        self.status = match std::fs::write(&path, html) {
+            Ok(_) => { let _ = open::that(&path); format!("Wrote report → {} (opened in browser)", path.display()) }
+            Err(e) => format!("Report export error: {}", e),
+        };
+    }
+
     fn batch_view(&mut self, ui: &mut egui::Ui) {
         let mut do_run = false;
         let mut do_export = false;
@@ -4747,6 +4833,34 @@ fn x_name_base(full: &str) -> String {
 /// Compact channel name (drop the "-A" area suffix) for gate labels.
 fn short_chan(name: &str) -> String {
     name.strip_suffix("-A").unwrap_or(name).to_string()
+}
+
+/// Human description of a display transform (for the reproducibility report).
+fn describe_tf(t: &AxisTransform) -> String {
+    match t {
+        AxisTransform::Linear => "Linear".into(),
+        AxisTransform::Log { .. } => "Log".into(),
+        AxisTransform::Asinh { cofactor } => format!("Asinh (cofactor {})", cofactor),
+        AxisTransform::Logicle { t, w, m, a } => format!("Logicle (t={}, w={}, m={}, a={})", t, w, m, a),
+    }
+}
+
+/// Format a gate bound, collapsing the ±1e12 quadrant sentinels to ±∞.
+fn rb(v: f64) -> String {
+    if v >= 1e11 { "+∞".into() } else if v <= -1e11 { "−∞".into() } else { format!("{:.1}", v) }
+}
+
+/// One-line gate shape description in display coordinates (for the report).
+fn shape_desc(s: &GateShape) -> String {
+    match s {
+        GateShape::Rect { x_min, x_max, y_min, y_max } =>
+            format!("rect: X∈[{}, {}], Y∈[{}, {}]", rb(*x_min), rb(*x_max), rb(*y_min), rb(*y_max)),
+        GateShape::Ellipse { cx, cy, rx, ry, angle } =>
+            format!("ellipse: c=({:.1}, {:.1}), r=({:.1}, {:.1}), θ={:.0}°", cx, cy, rx, ry, angle.to_degrees()),
+        GateShape::Polygon { vertices } => format!("polygon: {} vertices", vertices.len()),
+        GateShape::Range { x_min, x_max } => format!("interval: [{}, {}]", rb(*x_min), rb(*x_max)),
+        GateShape::Boolean { op, refs } => format!("{:?} of {} gate(s)", op, refs.len()),
+    }
 }
 
 /// Iso-density contour line segments via marching squares over the density grid.
