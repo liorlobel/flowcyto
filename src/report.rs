@@ -177,9 +177,13 @@ pub fn html(r: &ReportData) -> String {
 
     // Reproducibility.
     h.push_str("<h2>Reproducibility</h2>\n\
-        <p>The numeric layers (parsing, compensation, asinh, logicle) are validated \
-        against R/flowCore — run <code>flowcyto selftest</code> to reproduce the benchmark. \
-        The gating below can be re-imported into flowcyto (Gates → Load).</p>\n");
+        <p>The numeric layers (parsing, compensation, asinh, logicle, and gating) are \
+        validated against R/flowCore — run <code>flowcyto selftest</code> to reproduce the \
+        benchmark. The gating below can be re-imported into flowcyto (Gates → Load).</p>\n\
+        <p class=\"note\">This report is aligned with the MIFlowCyt Data Analysis reporting \
+        requirements: it records the list-mode data file (Sample), the compensation matrix \
+        and its source, the display transforms and gating strategy, and the per-population \
+        descriptive statistics.</p>\n");
     h.push_str(&format!(
         "<details><summary>Gate definitions (JSON)</summary><pre class=\"json\">{}</pre></details>\n",
         esc(&r.gates_json)
@@ -239,6 +243,7 @@ mod tests {
         let h = html(&r);
         assert!(h.contains("flowcyto analysis report"));
         assert!(h.contains("Compensation") && h.contains("Gating strategy") && h.contains("flowcyto selftest"));
+        assert!(h.contains("MIFlowCyt"), "report should state MIFlowCyt Data Analysis alignment");
         assert!(h.contains("a&lt;b&gt;.fcs"), "file name must be HTML-escaped");
         assert!(!h.contains("a<b>.fcs"), "raw unescaped name must not appear");
         assert!(h.contains("CD3+") && h.contains("1234"));
