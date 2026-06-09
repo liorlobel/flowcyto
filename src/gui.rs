@@ -1905,6 +1905,9 @@ impl FlowCytoApp {
         ui.horizontal(|ui| {
             if ui.button(format!("{} Save", icon::FLOPPY_DISK)).clicked() { self.save_gates(); }
             if ui.button(format!("{} Load", icon::FOLDER_OPEN)).clicked() { self.load_gates(); }
+            if ui.button(format!("{} Gating-ML", icon::EXPORT))
+                .on_hover_text("Export gates to Gating-ML 2.0 XML (flowCore/CytoML/FlowKit interop)").clicked()
+            { self.export_gatingml(); }
         });
 
         // Boolean (AND/OR/NOT) gate builder.
@@ -2195,6 +2198,34 @@ impl FlowCytoApp {
             {
                 Ok(_) => self.status = format!("Saved {} gates → {}", self.gates.len(), path.display()),
                 Err(e) => self.status = format!("Save error: {}", e),
+            }
+        }
+    }
+
+    /// Export the gate tree to Gating-ML 2.0 XML (interoperates with flowCore/CytoML,
+    /// FlowKit, …). Validated: a flowcyto-exported file, re-read by FlowKit, reproduces
+    /// flowcyto's population counts exactly (linear + asinh gates, full hierarchy).
+    fn export_gatingml(&mut self) {
+        if self.gates.is_empty() { self.status = "No gates to export.".into(); return; }
+        let comp_channels: Vec<String> = self.fcs.as_ref()
+            .and_then(|f| f.spillover_keyword())
+            .and_then(|kw| crate::compensation::parse_spillover(kw).ok())
+            .map(|(ch, _)| ch)
+            .unwrap_or_default();
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Gating-ML", &["xml"]).set_file_name("gates.xml").save_file()
+        {
+            let (xml, warnings) = crate::gatingml::to_gating_ml(&self.gates, &comp_channels, self.do_compensate);
+            match std::fs::write(&path, xml).map_err(|e| e.to_string()) {
+                Ok(_) => {
+                    let mut s = format!("Exported {} gate(s) → {} (Gating-ML 2.0)", self.gates.len(), path.display());
+                    if self.spill_override.is_some() {
+                        s.push_str(" · note: compensation references the file's $SPILLOVER, not the in-app override");
+                    }
+                    if !warnings.is_empty() { s.push_str(&format!(" · ⚠ {}", warnings.join("; "))); }
+                    self.status = s;
+                }
+                Err(e) => self.status = format!("Gating-ML export error: {}", e),
             }
         }
     }

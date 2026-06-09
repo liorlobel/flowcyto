@@ -11,6 +11,7 @@ mod compensation;
 mod fcs;
 mod fcs_write;
 mod gating;
+mod gatingml;
 mod gui;
 mod logicle;
 mod popstats;
@@ -121,6 +122,19 @@ enum Command {
     /// Show the $SPILLOVER (compensation) matrix embedded in the FCS file.
     Spillover {
         file: PathBuf,
+    },
+
+    /// Export gate definitions (JSON) to Gating-ML 2.0 XML for interoperability with
+    /// flowCore/CytoML, FlowKit, etc. The sample FCS supplies the $SPILLOVER channel
+    /// names so compensated fluorescence dimensions reference the file's matrix.
+    GatingMl {
+        file: PathBuf,
+        #[arg(short, long)]
+        gates: PathBuf,
+        #[arg(long)]
+        compensate: bool,
+        #[arg(short, long, help = "Output .xml path")]
+        output: PathBuf,
     },
 
     /// Compute a spillover matrix from single-stain controls + an unstained control.
@@ -235,6 +249,8 @@ fn main() -> Result<()> {
         Command::Popstats { file, gates, compensate, output } =>
             cmd_popstats(&file, &gates, compensate, output.as_deref()),
         Command::Spillover { file } => cmd_spillover(&file),
+        Command::GatingMl { file, gates, compensate, output } =>
+            cmd_gatingml(&file, &gates, compensate, &output),
         Command::ComputeSpillover { unstained, controls, output } =>
             cmd_compute_spillover(&unstained, &controls, output.as_deref()),
         Command::RewriteSpillover { file, matrix, output } =>
@@ -339,6 +355,31 @@ fn cmd_info(path: &Path) -> Result<()> {
         println!("(run `flowcyto spillover {}` for the full matrix)", path.display());
     } else {
         println!("\n$SPILLOVER: not present");
+    }
+    Ok(())
+}
+
+fn cmd_gatingml(path: &Path, gates_path: &Path, compensate: bool, output: &Path) -> Result<()> {
+    let fcs = FcsFile::open(path)?;
+    // Fluorescence channels (from the embedded $SPILLOVER) get compensation-ref="FCS".
+    let comp_channels: Vec<String> = match fcs.spillover_keyword() {
+        Some(kw) => parse_spillover(kw).map(|(ch, _)| ch).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let gates: Vec<Gate> = serde_json::from_str(
+        &std::fs::read_to_string(gates_path)
+            .with_context(|| format!("reading gates {:?}", gates_path))?,
+    )
+    .context("parsing gates JSON")?;
+
+    let (xml, warnings) = gatingml::to_gating_ml(&gates, &comp_channels, compensate);
+    std::fs::write(output, &xml).with_context(|| format!("writing {:?}", output))?;
+    println!("Wrote {} gate(s) → {} (Gating-ML 2.0)", gates.len(), output.display());
+    if compensate && comp_channels.is_empty() {
+        println!("  note: --compensate set but the file has no $SPILLOVER; dimensions are uncompensated");
+    }
+    for w in &warnings {
+        println!("  ⚠ {}", w);
     }
     Ok(())
 }
