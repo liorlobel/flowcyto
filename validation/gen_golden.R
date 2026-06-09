@@ -40,6 +40,36 @@ for (ch in fl) for (e in seq_len(K)) {
   add("comp",  ch, e - 1, comp[e, ch])
 }
 
+# ── Gating layer: population counts + median MFI on compensated data, so flowcyto's
+#    Linear-transform gates operate on identical coordinates and match flowCore's
+#    rectangleGate / polygonGate exactly. The discriminating boundaries are the FSC
+#    scatter threshold (uncompensated → bit-identical between the two) and the
+#    fluorescence neg/pos valley at 5000 (sparse → no boundary flips from the ~1e-10
+#    compensation delta). Includes one hierarchy level (Cells -> FITC+).
+comp_ff <- compensate(ff, mat)
+cexpr   <- exprs(comp_ff)
+lgl <- function(frame, g) as(filter(frame, g), "logical")   # membership vector
+# G1 "Cells": FSC-A high (2-D rectangle; SSC spans the full range)
+g1 <- rectangleGate(filterId = "Cells", "FSC-A" = c(20000, 1e6), "SSC-A" = c(-1e6, 1e6))
+m1 <- lgl(comp_ff, g1)
+add("gate", "", "Cells_count", sum(m1))
+# G2: child of G1 — FITC+ (hierarchy / within-parent count + median MFI)
+g2 <- rectangleGate(filterId = "FITCpos", "FITC-A" = c(5000, 1e6))
+m2 <- lgl(Subset(comp_ff, g1), g2)
+add("gate", "",       "FITCpos_count",  sum(m2))
+# medians over the gated population (FITC+ within Cells)
+mfi <- (m1 & lgl(comp_ff, g2))
+add("gate", "FITC-A", "FITCpos_median", median(cexpr[mfi, "FITC-A"]))
+add("gate", "FSC-A",  "FITCpos_median", median(cexpr[mfi, "FSC-A"]))
+# G3 "PEpos": polygon on (PE-A, SSC-A)
+poly <- polygonGate(filterId = "PEpos", .gate = matrix(
+  c(5000, -1e6,  50000, -1e6,  50000, 1e6,  5000, 1e6),
+  ncol = 2, byrow = TRUE, dimnames = list(NULL, c("PE-A", "SSC-A"))))
+m3 <- lgl(comp_ff, poly)
+add("gate", "", "PEpos_count", sum(m3))
+add("gate", "PE-A", "PEpos_median", median(cexpr[m3, "PE-A"]))
+cat("gate counts: Cells =", sum(m1), " FITC+ =", sum(m2), " PE+ =", sum(m3), "\n")
+
 golden <- do.call(rbind, rows)
 write.csv(golden, out, row.names = FALSE, quote = FALSE)
 cat("wrote", nrow(golden), "golden values (flowCore", as.character(packageVersion("flowCore")), ") to", out, "\n")

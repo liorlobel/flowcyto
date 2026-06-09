@@ -269,3 +269,9 @@ parse,PE-Cy7-A,38,23416.08594
 comp,PE-Cy7-A,38,23303.33126
 parse,PE-Cy7-A,39,28115.33203
 comp,PE-Cy7-A,39,27991.24116
+gate,,Cells_count,566
+gate,,FITCpos_count,200
+gate,FITC-A,FITCpos_median,24277.15597
+gate,FSC-A,FITCpos_median,34419.51562
+gate,,PEpos_count,160
+gate,PE-A,PEpos_median,24545.91083

@@ -44,6 +44,46 @@ pub fn run() -> Result<Vec<LayerResult>, String> {
     let asinh = AxisTransform::Asinh { cofactor: COFACTOR }.compile();
     let logicle = AxisTransform::Logicle { t: 262144.0, w: 0.5, m: 4.5, a: 0.0 }.compile();
 
+    // ── Gating layer: population counts + median MFI of gated populations, applied
+    //    by flowcyto's own gating engine to the compensated reference and compared to
+    //    flowCore's rectangleGate/polygonGate golden. Gates are in compensated/linear
+    //    space (Linear transform) so both operate on identical coordinates; G2 is a
+    //    child of G1 (within-parent count). Keyed (channel, key) → value.
+    let gates = {
+        use crate::gating::{Gate, GateShape};
+        use crate::transform::AxisTransform::Linear as Lin;
+        vec![
+            Gate { id: 1, name: "Cells".into(), parent: None,
+                x_channel: "FSC-A".into(), y_channel: "SSC-A".into(), x_transform: Lin, y_transform: Lin,
+                shape: GateShape::Rect { x_min: 20000.0, x_max: 1e6, y_min: -1e6, y_max: 1e6 }, quad_group: None },
+            Gate { id: 2, name: "FITCpos".into(), parent: Some(1),
+                x_channel: "FITC-A".into(), y_channel: "FITC-A".into(), x_transform: Lin, y_transform: Lin,
+                shape: GateShape::Range { x_min: 5000.0, x_max: 1e6 }, quad_group: None },
+            Gate { id: 3, name: "PEpos".into(), parent: None,
+                x_channel: "PE-A".into(), y_channel: "SSC-A".into(), x_transform: Lin, y_transform: Lin,
+                shape: GateShape::Polygon { vertices: vec![[5000.0, -1e6], [50000.0, -1e6], [50000.0, 1e6], [5000.0, 1e6]] }, quad_group: None },
+        ]
+    };
+    let own = crate::gating::compute_own_masks(&gates, &comp, &fcs.parameters, fcs.n_events);
+    let by_id: std::collections::HashMap<u32, &crate::gating::Gate> = gates.iter().map(|g| (g.id, g)).collect();
+    let eff = |id: u32| crate::gating::effective_mask(id, &by_id, &own, fcs.n_events);
+    let count = |m: &[bool]| m.iter().filter(|&&b| b).count() as f64;
+    let median_in = |m: &[bool], ch: &str| -> f64 {
+        let ci = fcs.parameters.iter().position(|p| p.name == ch).unwrap();
+        let mut v: Vec<f64> = (0..fcs.n_events).filter(|&e| m[e]).map(|e| comp[e * np + ci]).collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = v.len();
+        if n == 0 { 0.0 } else if n % 2 == 1 { v[n / 2] } else { 0.5 * (v[n / 2 - 1] + v[n / 2]) }
+    };
+    let (m1, m2, m3) = (eff(1), eff(2), eff(3));
+    let mut gate_results: std::collections::HashMap<(String, String), f64> = std::collections::HashMap::new();
+    gate_results.insert((String::new(), "Cells_count".into()), count(&m1));
+    gate_results.insert((String::new(), "FITCpos_count".into()), count(&m2));
+    gate_results.insert(("FITC-A".into(), "FITCpos_median".into()), median_in(&m2, "FITC-A"));
+    gate_results.insert(("FSC-A".into(), "FITCpos_median".into()), median_in(&m2, "FSC-A"));
+    gate_results.insert((String::new(), "PEpos_count".into()), count(&m3));
+    gate_results.insert(("PE-A".into(), "PEpos_median".into()), median_in(&m3, "PE-A"));
+
     // layer -> (probe count, max relative deviation)
     let mut acc: std::collections::BTreeMap<&str, (usize, f64)> = std::collections::BTreeMap::new();
     for line in GOLDEN_CSV.lines().skip(1) {
@@ -68,6 +108,9 @@ pub fn run() -> Result<Vec<LayerResult>, String> {
                 }
                 if kind == "parse" { fcs.events[idx] } else { comp[idx] }
             }
+            "gate" => *gate_results
+                .get(&(channel.to_string(), key.to_string()))
+                .ok_or_else(|| format!("no gate result for {channel}/{key}"))?,
             _ => continue,
         };
         let rel = (computed - golden).abs() / (golden.abs() + 1.0);
@@ -91,6 +134,7 @@ fn layer_name(kind: &str) -> &'static str {
         "comp" => "Compensation",
         "asinh" => "Asinh transform",
         "logicle" => "Logicle transform",
+        "gate" => "Gating",
         _ => "Other",
     }
 }
