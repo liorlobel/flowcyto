@@ -432,10 +432,61 @@ impl SpilloverMatrix {
     }
 }
 
+/// Residual mis-compensation **heuristic** for a source→detector channel pair: an estimate
+/// of the *leftover spillover coefficient*, computed in LINEAR (compensated) space. Under
+/// the spillover model `obs_y = true_y + S·true_x`, splitting the source channel into
+/// positive/negative gives `Δmedian_y ≈ S·Δmedian_x`, so
+///     S ≈ (median(y|x⁺) − median(y|x⁻)) / (median(x|x⁺) − median(x|x⁻)).
+/// This is in the same units as the spillover-matrix entries (≈0.15 = 15% residual
+/// spillover), directly comparable, and spread-independent (unlike an SD-normalized shift,
+/// which washes out on wide negatives). `x_lin`/`y_lin` = the source/detector linear values;
+/// `x_pos`/`x_neg` = same-length masks from the source's density-valley split.
+/// `> 0` ⇒ under-compensated (source still bleeds into detector); `< 0` ⇒ over-compensated.
+/// `None` when either population is too small (<20) or the source split is degenerate.
+/// A HINT, not a calibrated readout: genuine co-expression (x⁺ cells truly y⁺) inflates it
+/// identically — read sign + magnitude qualitatively.
+pub fn comp_residual(x_lin: &[f64], y_lin: &[f64], x_pos: &[bool], x_neg: &[bool]) -> Option<f64> {
+    let median = |mask: &[bool], data: &[f64]| -> Option<f64> {
+        let mut v: Vec<f64> = Vec::new();
+        for (i, &keep) in mask.iter().enumerate() {
+            if keep && i < data.len() && data[i].is_finite() { v.push(data[i]); }
+        }
+        if v.len() < 20 { return None; }
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = v.len();
+        Some(if n % 2 == 1 { v[n / 2] } else { 0.5 * (v[n / 2 - 1] + v[n / 2]) })
+    };
+    let dx = median(x_pos, x_lin)? - median(x_neg, x_lin)?;
+    if dx.abs() < 1e-6 { return None; } // degenerate split → ratio undefined
+    let dy = median(x_pos, y_lin)? - median(x_neg, y_lin)?;
+    Some(dy / dx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_util::make_fcs;
+
+    #[test]
+    fn comp_residual_recovers_coefficient() {
+        // 100 source-positive (x≈1000) then 100 source-negative (x≈0).
+        let pos: Vec<bool> = (0..200).map(|i| i < 100).collect();
+        let neg: Vec<bool> = (0..200).map(|i| i >= 100).collect();
+        let x: Vec<f64> = (0..200).map(|i| if i < 100 { 1000.0 + (i % 7) as f64 } else { (i % 7) as f64 }).collect();
+        // y = 0.15·x  →  recover the residual spillover coefficient ≈ 0.15.
+        let y: Vec<f64> = x.iter().map(|v| 0.15 * v).collect();
+        assert!((comp_residual(&x, &y, &pos, &neg).unwrap() - 0.15).abs() < 0.01);
+        // Over-compensated: y = −0.10·x → ≈ −0.10.
+        let yn: Vec<f64> = x.iter().map(|v| -0.10 * v).collect();
+        assert!((comp_residual(&x, &yn, &pos, &neg).unwrap() + 0.10).abs() < 0.01);
+        // No spillover (y flat) → ≈ 0.
+        let y0: Vec<f64> = (0..200).map(|i| (i % 5) as f64).collect();
+        assert!(comp_residual(&x, &y0, &pos, &neg).unwrap().abs() < 0.02);
+        // Degenerate source split (no x separation) → None.
+        assert!(comp_residual(&vec![5.0; 200], &y, &pos, &neg).is_none());
+        // Too few events → None.
+        assert!(comp_residual(&[1.0, 2.0], &[1.0, 2.0], &[true, false], &[false, true]).is_none());
+    }
 
     // ── parse / format round-trip ──────────────────────────────────────────
 

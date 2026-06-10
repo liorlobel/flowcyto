@@ -239,6 +239,24 @@ struct HeatGrid {
     extent: [f64; 4], // [xmin, xmax, ymin, ymax] in display coords
 }
 
+/// One cell of the N×N compensation cross-check: a density scatter (display space) plus
+/// a residual mis-compensation flag (linear-space heuristic). Empty/None on the diagonal.
+struct CompCell {
+    buckets: Vec<Vec<[f64; 2]>>,
+    residual: Option<f64>,
+}
+
+/// Cached N×N compensation cross-check over the spillover channels. Rebuilt only when the
+/// section is open and a key changes (data/compensate/override/transform/population).
+struct CompCheck {
+    gen: u64,
+    pop: Option<u32>,
+    comp: bool,
+    tkey: String,
+    chans: Vec<(usize, String)>, // (param index, name) of the spillover channels
+    cells: Vec<CompCell>,        // row-major r*N + c (x = column channel, y = row channel)
+}
+
 /// A user-supplied / edited spillover matrix that overrides the embedded one.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct SpillOverride {
@@ -368,6 +386,7 @@ pub struct FlowCytoApp {
     titration_pos: Option<u32>,                  // positive population gate id (None = unset)
     titration_neg: Option<u32>,                  // negative population gate id (None = "All events")
     titration_logx: bool,                        // log-scale the concentration (dose) axis
+    comp_check_cache: Option<CompCheck>,         // N×N compensation cross-check (Spillover tab)
     // QC suite — per-tube acquisition quality, streamed like the batch.
     qc_live_gate: Option<u32>,                   // gate designated as the viability population
     qc_rows: Vec<QcRow>,
@@ -471,6 +490,7 @@ impl Default for FlowCytoApp {
             batch_plot_pop: None, batch_plot_metric: BatchMetric::PctParent,
             batch_rx: None, batch_cancel: None, batch_progress: None,
             titration_channel: 0, titration_pos: None, titration_neg: None, titration_logx: true,
+            comp_check_cache: None,
             qc_live_gate: None, qc_rows: Vec::new(), qc_rx: None, qc_cancel: None, qc_progress: None,
             update_rx: None, update_msg: None, update_found: None,
             ref_sample: None, ref_scatter: None,
@@ -4836,6 +4856,139 @@ impl FlowCytoApp {
                 if act_write { self.write_fcs_override(&ch, &rows); }
             }
         }
+
+        // Compensation cross-check (N×N) — an all-pairs view of the compensated data with a
+        // per-pair residual flag. Computed only while the section is expanded (the closure
+        // runs only when open), cached across frames.
+        ui.separator();
+        egui::CollapsingHeader::new(format!("{} Compensation cross-check (N×N)", icon::GRID_NINE))
+            .id_salt("comp_check")
+            .show(ui, |ui| { self.comp_check_matrix(ui); });
+    }
+
+    /// Build the N×N compensation cross-check cache over the spillover channels.
+    fn build_comp_check(&self, chans: &[(usize, String)], tkey: String) -> CompCheck {
+        let n = chans.len();
+        let np = self.fcs.as_ref().map(|f| f.n_params()).unwrap_or(1).max(1);
+        let kept = self.grid_kept();
+        let cap = (24_000 / (n * n).max(1)).clamp(500, 4000);
+        // Split each source (column) channel at its density valley ONCE, reused down the
+        // column; None when not cleanly bimodal → the residual reads n/a.
+        let col_masks: Vec<Option<(Vec<bool>, Vec<bool>, Vec<f64>)>> = chans.iter().map(|(ci, _)| {
+            if self.compensated.len() < np { return None; }
+            let x_lin: Vec<f64> = kept.iter().map(|&e| self.compensated[e * np + ci]).collect();
+            let xt = self.cur_tf(*ci).compile();
+            let dx_disp: Vec<f64> = x_lin.iter().map(|&v| xt.forward(v)).collect();
+            match crate::autogate::valley_threshold(&dx_disp, DENSITY_BINS) {
+                Some((thr, depth)) if depth >= 0.05 => Some((
+                    dx_disp.iter().map(|&v| v > thr).collect(),
+                    dx_disp.iter().map(|&v| v <= thr).collect(),
+                    x_lin,
+                )),
+                _ => None,
+            }
+        }).collect();
+
+        let mut cells = Vec::with_capacity(n * n);
+        for r in 0..n {
+            // Detector (row) channel in LINEAR (compensated) space — the residual is linear.
+            let y_lin: Vec<f64> = kept.iter().map(|&e| self.compensated[e * np + chans[r].0]).collect();
+            for c in 0..n {
+                if r == c {
+                    cells.push(CompCell { buckets: Vec::new(), residual: None });
+                    continue;
+                }
+                let buckets = self.compute_cell_buckets(chans[c].0, chans[r].0, &kept, cap);
+                let residual = col_masks[c].as_ref()
+                    .and_then(|(pos, neg, x_lin)| crate::compensation::comp_residual(x_lin, &y_lin, pos, neg));
+                cells.push(CompCell { buckets, residual });
+            }
+        }
+        CompCheck { gen: self.data_gen, pop: self.active_pop, comp: self.do_compensate, tkey, chans: chans.to_vec(), cells }
+    }
+
+    /// Transform signature of the cross-check channels — invalidates the cache on a scale change.
+    fn comp_check_tkey(&self, chans: &[(usize, String)]) -> String {
+        chans.iter().map(|(i, _)| self.cur_tf(*i).short_label()).collect::<Vec<_>>().join(",")
+    }
+
+    /// The N×N compensation cross-check grid (each off-diagonal cell: column channel x vs
+    /// row channel y, compensated, with a residual flag; diagonal = channel name).
+    fn comp_check_matrix(&mut self, ui: &mut egui::Ui) {
+        let chans: Vec<(usize, String)> = match self.active_matrix() {
+            Some((names, _)) => names.iter()
+                .filter_map(|nm| self.fcs.as_ref().and_then(|f| f.param_index(nm)).map(|i| (i, nm.clone())))
+                .collect(),
+            None => { ui.label(RichText::new("No spillover matrix for this file.").small().color(Color32::GRAY)); return; }
+        };
+        let n = chans.len();
+        if n < 2 {
+            ui.label(RichText::new("Needs at least two fluorescence channels.").small().color(Color32::GRAY));
+            return;
+        }
+        if n > 10 {
+            ui.label(RichText::new(format!("{} channels → {} cells; first render may take a moment.", n, n * n))
+                .small().color(Color32::from_rgb(220, 170, 60)));
+        }
+        ui.label(RichText::new("Each cell: column channel (x) vs row channel (y), compensated — a flat (horizontal) population is well compensated. Flag ≈ residual spillover coefficient (matrix units; 0.05 = 5% leftover): + under-, − over-compensated; n/a = no clear positive. The number is reliable on SINGLE-STAIN compensation controls (negative truly negative); on a fully-stained/mixed sample trust the plot shape, not the flag — population structure (co-expression) confounds it.")
+            .small().color(Color32::GRAY));
+
+        let tkey = self.comp_check_tkey(&chans);
+        let stale = self.comp_check_cache.as_ref().map(|c|
+            c.gen != self.data_gen || c.pop != self.active_pop || c.comp != self.do_compensate || c.tkey != tkey || c.chans != chans
+        ).unwrap_or(true);
+        if stale {
+            let built = self.build_comp_check(&chans, tkey);
+            self.comp_check_cache = Some(built);
+        }
+        let cache = match &self.comp_check_cache { Some(c) => c, None => return };
+        let dark = self.dark_mode;
+        let cmap = self.colormap;
+        let cell = 92.0_f32;
+
+        egui::ScrollArea::both().max_height(560.0).show(ui, |ui| {
+            egui::Grid::new("comp_check_grid").spacing([3.0, 3.0]).show(ui, |ui| {
+                for r in 0..n {
+                    for c in 0..n {
+                        let cc = &cache.cells[r * n + c];
+                        ui.allocate_ui(egui::vec2(cell, cell + 14.0), |ui| {
+                            ui.vertical(|ui| {
+                                if r == c {
+                                    ui.add_space(cell * 0.4);
+                                    ui.centered_and_justified(|ui| { ui.strong(short_chan(&x_name_base(&chans[r].1))); });
+                                    return;
+                                }
+                                match cc.residual {
+                                    Some(s) => {
+                                        let col = if s.abs() < 0.02 { Color32::from_rgb(80, 200, 120) }
+                                            else if s.abs() < 0.05 { Color32::from_rgb(230, 180, 60) }
+                                            else { Color32::from_rgb(230, 90, 80) };
+                                        ui.label(RichText::new(format!("{:+.2}", s)).small().strong().color(col))
+                                            .on_hover_text(if s > 0.0 { "residual spillover (under-compensated): source still bleeds into detector" } else { "over-compensated (over-subtracted)" });
+                                    }
+                                    None => { ui.label(RichText::new("n/a").small().color(Color32::GRAY))
+                                        .on_hover_text("no clear positive population in the source channel to assess"); }
+                                }
+                                let buckets = cc.buckets.clone();
+                                Plot::new(format!("cc_{}_{}", r, c))
+                                    .width(cell).height(cell - 4.0)
+                                    .show_axes(egui::Vec2b::new(false, false))
+                                    .show_grid(egui::Vec2b::new(false, false))
+                                    .allow_drag(false).allow_zoom(false).allow_scroll(false)
+                                    .show(ui, |pu| {
+                                        for (k, pts) in buckets.iter().enumerate() {
+                                            if pts.is_empty() { continue; }
+                                            pu.points(Points::new(PlotPoints::new(pts.clone()))
+                                                .radius(1.0).color(density_color(k, N_BUCKETS, dark, cmap)));
+                                        }
+                                    });
+                            });
+                        });
+                    }
+                    ui.end_row();
+                }
+            });
+        });
     }
 
     /// The matrix currently in effect: the override if set, else the embedded one.
