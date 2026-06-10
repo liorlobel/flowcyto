@@ -1776,9 +1776,9 @@ impl FlowCytoApp {
 
     /// Compact per-axis scale picker for a grid cell. Edits the channel's shared
     /// transform (same one the left panel uses), so it updates everywhere.
-    fn grid_axis_scale(&mut self, ui: &mut egui::Ui, id: &str, ch: usize) {
+    fn grid_axis_scale(&mut self, ui: &mut egui::Ui, id: &str, ch: usize, width: f32) {
         let cur = self.cur_tf(ch);
-        egui::ComboBox::from_id_salt(id).selected_text(cur.short_label()).width(74.0).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt(id).selected_text(cur.short_label()).width(width).show_ui(ui, |ui| {
             let opts = [
                 ("Linear", AxisTransform::Linear),
                 ("Log", AxisTransform::default_log()),
@@ -2426,9 +2426,10 @@ impl FlowCytoApp {
         let avail = ui.available_size();
         let gap = 8.0;
         let cw = (avail.x / cols as f32 - gap).max(110.0);
-        // Reserve room for the two header rows (channels + scale pickers) per cell.
-        const HEADER: f32 = 56.0;
-        let ch = (avail.y / rows as f32 - HEADER).max(70.0);
+        // Reserve room for the X-axis controls row (channel + scale) under each plot;
+        // the Y-axis controls sit to the LEFT of the plot, consuming width not height.
+        const FOOTER: f32 = 30.0;
+        let ch = (avail.y / rows as f32 - FOOTER).max(70.0);
 
         // Compute the shared kept-event list at most once per frame, only if a cell
         // actually rebuilds (avoids per-frame mask recompute when everything's cached).
@@ -2437,7 +2438,7 @@ impl FlowCytoApp {
             ui.horizontal(|ui| {
                 for col in 0..cols {
                     let idx = row * cols + col;
-                    ui.allocate_ui(egui::vec2(cw, ch + HEADER), |ui| {
+                    ui.allocate_ui(egui::vec2(cw, ch + FOOTER), |ui| {
                         ui.vertical(|ui| { self.grid_cell(ui, idx, cw, ch, cap, &mut kept); });
                     });
                 }
@@ -2456,24 +2457,11 @@ impl FlowCytoApp {
         let names: Vec<String> = self.fcs.as_ref().map(|f|
             (0..f.n_params()).map(|i| param_full_label(f, i)).collect()).unwrap_or_default();
 
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt(format!("gx{}", idx))
-                .selected_text(names.get(xi).cloned().unwrap_or_default()).width(cw * 0.42)
-                .show_ui(ui, |ui| { for (i, nm) in names.iter().enumerate() {
-                    ui.selectable_value(&mut xi, i, nm); } });
-            ui.label("×");
-            egui::ComboBox::from_id_salt(format!("gy{}", idx))
-                .selected_text(names.get(yi).cloned().unwrap_or_default()).width(cw * 0.42)
-                .show_ui(ui, |ui| { for (i, nm) in names.iter().enumerate() {
-                    ui.selectable_value(&mut yi, i, nm); } });
-        });
-        self.grid_channels[idx] = (xi, yi);
-        // per-axis scale pickers (Linear/Log/Asinh/Logicle) right in the cell
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("scale").small().color(Color32::GRAY));
-            self.grid_axis_scale(ui, &format!("gxt{}", idx), xi);
-            self.grid_axis_scale(ui, &format!("gyt{}", idx), yi);
-        });
+        // Axis pickers now live AT the axes — Y (channel + scale) to the LEFT of the plot,
+        // X (channel + scale) BELOW it — see the layout block further down. Selections land
+        // in `new_*` and are written to grid_channels at the end (applied next frame).
+        let mut new_xi = xi;
+        let mut new_yi = yi;
 
         // (re)build this cell's buckets if channels/transforms/data changed
         let cur_xt = self.cur_tf(xi);
@@ -2567,11 +2555,28 @@ impl FlowCytoApp {
             Some(PlotBounds::from_min_max([dxr.0 - mx, dyr.0 - my], [dxr.1 + mx, dyr.1 + my]))
         } else { None };
 
-        let resp = Plot::new(format!("grid_{}_{}_{}_{}_{}_{}", idx, xi, yi, cur_xt.short_label(), cur_yt.short_label(), lock_view))
-            .width(cw).height(ch).allow_scroll(false)
+        let gap = 8.0;
+        let wy = 52.0;                               // two vertical (rotated) Y-axis dropdowns
+        let plot_w = (cw - wy - gap).max(60.0);
+        let scale_opts: Vec<String> = ["Linear", "Log", "Asinh", "Logicle"].iter().map(|s| s.to_string()).collect();
+        let cur_y_scale = scale_opts.iter().position(|s| s.as_str() == cur_yt.short_label()).unwrap_or(0);
+        let resp = ui.horizontal(|ui| {
+            // Y-axis channel + scale as vertical (rotated) text along the y-axis.
+            if let Some(i) = vertical_picker(ui, &format!("gyc{}", idx), ch, yi, &names) { new_yi = i; }
+            if let Some(s) = vertical_picker(ui, &format!("gys{}", idx), ch, cur_y_scale, &scale_opts) {
+                if yi < self.channel_tf.len() {
+                    self.channel_tf[yi] = match s {
+                        1 => AxisTransform::default_log(),
+                        2 => AxisTransform::Asinh { cofactor: 150.0 },
+                        3 => AxisTransform::default_logicle(),
+                        _ => AxisTransform::Linear,
+                    };
+                }
+            }
+            Plot::new(format!("grid_{}_{}_{}_{}_{}_{}", idx, xi, yi, cur_xt.short_label(), cur_yt.short_label(), lock_view))
+            .width(plot_w).height(ch).allow_scroll(false)
             .allow_drag(!drawing && !lock_view).allow_zoom(!drawing && !lock_view)
             .allow_double_click_reset(false) // double-click = drill into a gate
-            .x_axis_label(&x_name).y_axis_label(&y_name)
             .x_axis_formatter(move |gm: GridMark, _r| fmt_data_tick(xt_fmt.inverse(gm.value)))
             .y_axis_formatter(move |gm: GridMark, _r| fmt_data_tick(yt_fmt.inverse(gm.value)))
             .x_grid_spacer(move |inp| nonlinear_grid(&xt_grid, lin_x, inp))
@@ -2704,7 +2709,18 @@ impl FlowCytoApp {
                         DrawMode::Navigate => {}
                     }
                 }
-            });
+            })
+        }).inner;
+        // X-axis pickers (channel + scale), in a row directly under the plot, by the x-axis.
+        ui.horizontal(|ui| {
+            ui.add_space(wy + gap);
+            egui::ComboBox::from_id_salt(format!("gx{}", idx))
+                .selected_text(names.get(xi).cloned().unwrap_or_default()).width((plot_w * 0.55).clamp(80.0, 200.0))
+                .show_ui(ui, |ui| { for (i, nm) in names.iter().enumerate() {
+                    ui.selectable_value(&mut new_xi, i, nm); } });
+            self.grid_axis_scale(ui, &format!("gxt{}", idx), xi, 74.0);
+        });
+        self.grid_channels[idx] = (new_xi, new_yi);
 
         // ── apply interaction (only the active cell yields commits) ──
         self.drag_start = next_ds;
@@ -3041,8 +3057,6 @@ impl FlowCytoApp {
             xi, yi, cur_xt.short_label(), cur_yt.short_label(), self.x_manual, self.y_manual, lock_view
         ))
             .legend(Legend::default())
-            .x_axis_label(&x_name)
-            .y_axis_label(&y_name)
             .allow_drag(!drawing && !lock_view)
             .allow_zoom(!drawing && !lock_view)
             .allow_scroll(false)
@@ -3440,7 +3454,6 @@ impl FlowCytoApp {
 
         let plot = Plot::new(format!("hist_{}_{}_{}", xi, cur_xt.short_label(), norm_tag))
             .legend(Legend::default())
-            .x_axis_label(&x_name)
             .y_axis_label(y_label)
             .allow_drag(!drawing && !lock_view).allow_zoom(!drawing && !lock_view).allow_scroll(false)
             .x_axis_formatter(move |gm: GridMark, _r| fmt_data_tick(xt_fmt.inverse(gm.value)))
@@ -5066,6 +5079,46 @@ fn fmt(v: f64) -> String {
 }
 
 /// Tick label in data units with K/M suffixes (0, 30K, 262K, -10K, 0.5).
+/// A vertical (rotated, reads bottom→top) clickable picker — used for a grid cell's
+/// Y-axis channel and scale so they read like a conventional y-axis label. Draws the
+/// selected option as rotated text; clicking opens a popup of `options`. Returns
+/// `Some(new_index)` when a different option is chosen.
+fn vertical_picker(ui: &mut egui::Ui, id_src: &str, height: f32, selected: usize, options: &[String]) -> Option<usize> {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, height), egui::Sense::click());
+    let vis = *ui.style().interact(&resp);               // combo-style hover/active visuals
+    if resp.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+    let col = vis.fg_stroke.color;
+    // Dropdown-style box (fill + border), matching the horizontal ComboBoxes.
+    ui.painter().rect(rect, vis.rounding, vis.weak_bg_fill, vis.bg_stroke);
+    // ▾ caret (filled triangle) at the bottom, so it reads as a dropdown.
+    let cx = rect.center().x;
+    let cy = rect.max.y - 7.0;
+    let t = 3.5;
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![egui::pos2(cx - t, cy - t * 0.7), egui::pos2(cx + t, cy - t * 0.7), egui::pos2(cx, cy + t * 0.7)],
+        col, egui::Stroke::NONE));
+    // Vertical (rotated) label, centered in the area above the caret.
+    let area = egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.max.y - 14.0));
+    let text = options.get(selected).cloned().unwrap_or_default();
+    let galley = ui.painter().layout_no_wrap(text, egui::FontId::proportional(13.0), col);
+    let sz = galley.size();
+    // Center the galley in `area` after a -90° (counter-clockwise) rotation about `pos`.
+    let pos = area.center() + egui::vec2(-sz.y / 2.0, sz.x / 2.0);
+    ui.painter().add(egui::epaint::TextShape::new(pos, galley, col).with_angle(-std::f32::consts::FRAC_PI_2));
+    let popup_id = ui.make_persistent_id(id_src);
+    if resp.clicked() { ui.memory_mut(|m| m.toggle_popup(popup_id)); }
+    let mut chosen = None;
+    egui::popup_below_widget(ui, popup_id, &resp, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+        ui.set_min_width(150.0);
+        egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+            for (i, opt) in options.iter().enumerate() {
+                if ui.selectable_label(i == selected, opt).clicked() { chosen = Some(i); }
+            }
+        });
+    });
+    chosen
+}
+
 fn fmt_data_tick(v: f64) -> String {
     let a = v.abs();
     if a < 0.5 { return "0".into(); }
