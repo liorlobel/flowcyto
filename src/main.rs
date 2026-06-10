@@ -22,8 +22,10 @@ mod selftest;
 mod stats;
 #[cfg(test)]
 mod test_util;
+mod titration;
 mod transform;
 mod update;
+mod xlsx;
 
 use std::path::{Path, PathBuf};
 

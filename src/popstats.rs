@@ -23,6 +23,7 @@ pub struct PopulationStat {
     pub medians: Vec<f64>, // aligned to PopulationStatsTable::channels
     pub means: Vec<f64>,
     pub cvs: Vec<f64>,
+    pub rsds: Vec<f64>,    // robust SD = (84th pctile − median)/0.995 (stain-index spread)
 }
 
 pub struct PopulationStatsTable {
@@ -86,6 +87,7 @@ fn stat_row(
     let mut medians = Vec::with_capacity(stat_channels.len());
     let mut means = Vec::with_capacity(stat_channels.len());
     let mut cvs = Vec::with_capacity(stat_channels.len());
+    let mut rsds = Vec::with_capacity(stat_channels.len());
     for &ci in stat_channels {
         let mut vals: Vec<f64> = Vec::with_capacity(count);
         for (ev, &inside) in mask.iter().enumerate() {
@@ -93,27 +95,31 @@ fn stat_row(
                 vals.push(events[ev * n_params + ci]);
             }
         }
-        let (med, mean, cv) = med_mean_cv(&vals);
+        let (med, mean, cv, rsd) = med_mean_cv(&vals);
         medians.push(med);
         means.push(mean);
         cvs.push(cv);
+        rsds.push(rsd);
     }
 
     PopulationStat {
         name: name.to_string(), parent_name: parent_name.to_string(), depth,
-        count, pct_parent, pct_total, medians, means, cvs,
+        count, pct_parent, pct_total, medians, means, cvs, rsds,
     }
 }
 
-/// Median (R-style: average of two middle for even N), mean, CV%.
+/// Median (R-style: average of two middle for even N), mean, CV%, and robust SD.
 /// Non-finite values are dropped first so a single poisoned event (e.g. a NaN from a
 /// bad compensation matrix) can't NaN the whole population's MFI, and the sort stays a
 /// valid total order. For all-finite data this is identical to a plain reduction.
-fn med_mean_cv(vals: &[f64]) -> (f64, f64, f64) {
+/// Robust SD (rSD) = (84th percentile − median)/0.995 — the spread the stain index
+/// uses, robust to the skewed tails of compensated "negative" populations where the
+/// parametric SD overestimates (Maecker & Trotter; matches FlowJo's stain index).
+fn med_mean_cv(vals: &[f64]) -> (f64, f64, f64, f64) {
     let mut v: Vec<f64> = vals.iter().copied().filter(|x| x.is_finite()).collect();
     let n = v.len();
     if n == 0 {
-        return (f64::NAN, f64::NAN, f64::NAN);
+        return (f64::NAN, f64::NAN, f64::NAN, f64::NAN);
     }
     let mean = v.iter().sum::<f64>() / n as f64;
     let var = if n > 1 {
@@ -125,7 +131,19 @@ fn med_mean_cv(vals: &[f64]) -> (f64, f64, f64) {
     let cv = if mean.abs() > 1e-12 { 100.0 * sd / mean.abs() } else { f64::NAN };
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let med = if n % 2 == 1 { v[n / 2] } else { 0.5 * (v[n / 2 - 1] + v[n / 2]) };
-    (med, mean, cv)
+    let rsd = (percentile_sorted(&v, 0.84) - med) / 0.995;
+    (med, mean, cv, rsd)
+}
+
+/// Linear-interpolated percentile (`q` in [0,1]) of an already-sorted slice.
+fn percentile_sorted(sorted: &[f64], q: f64) -> f64 {
+    let n = sorted.len();
+    if n == 0 { return f64::NAN; }
+    if n == 1 { return sorted[0]; }
+    let idx = q * (n - 1) as f64;
+    let lo = idx.floor() as usize;
+    let frac = idx - lo as f64;
+    if lo + 1 < n { sorted[lo] + frac * (sorted[lo + 1] - sorted[lo]) } else { sorted[n - 1] }
 }
 
 /// Format a stat cell for CSV: a non-finite value (e.g. an empty population's NaN MFI)
@@ -254,7 +272,7 @@ mod tests {
 
     #[test]
     fn med_mean_cv_known_values() {
-        let (med, mean, cv) = med_mean_cv(&[2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]);
+        let (med, mean, cv, _rsd) = med_mean_cv(&[2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]);
         assert_eq!(med, 4.5);
         assert!((mean - 5.0).abs() < 1e-12);
         // Sample SD (n-1): sum of squared deviations = 32, /(8-1) = 32/7.
@@ -263,15 +281,25 @@ mod tests {
     }
 
     #[test]
+    fn percentile_and_robust_sd_known() {
+        let v: Vec<f64> = (0..=10).map(|x| x as f64).collect(); // 0..10, sorted
+        // 84th percentile: idx = 0.84*10 = 8.4 → 8 + 0.4*(9-8) = 8.4
+        assert!((percentile_sorted(&v, 0.84) - 8.4).abs() < 1e-9);
+        // median 5 → rSD = (8.4 − 5)/0.995
+        let (_m, _mn, _cv, rsd) = med_mean_cv(&v);
+        assert!((rsd - (8.4 - 5.0) / 0.995).abs() < 1e-9);
+    }
+
+    #[test]
     fn med_mean_cv_empty_is_nan() {
-        let (med, mean, cv) = med_mean_cv(&[]);
-        assert!(med.is_nan() && mean.is_nan() && cv.is_nan());
+        let (med, mean, cv, rsd) = med_mean_cv(&[]);
+        assert!(med.is_nan() && mean.is_nan() && cv.is_nan() && rsd.is_nan());
     }
 
     #[test]
     fn med_mean_cv_drops_non_finite() {
         // Audit M1d: a NaN/Inf among the values must not poison the median or mean.
-        let (med, mean, _cv) = med_mean_cv(&[2.0, f64::NAN, 4.0, f64::INFINITY, 6.0]);
+        let (med, mean, _cv, _rsd) = med_mean_cv(&[2.0, f64::NAN, 4.0, f64::INFINITY, 6.0]);
         assert_eq!(med, 4.0, "median over the finite {{2,4,6}}");
         assert!((mean - 4.0).abs() < 1e-12, "mean over the finite {{2,4,6}}");
     }
@@ -297,6 +325,7 @@ mod tests {
                 medians: vec![1234.5],
                 means: vec![1200.0],
                 cvs: vec![30.0],
+                rsds: vec![20.0],
             }],
         };
         let mut out = String::new();
@@ -318,6 +347,7 @@ mod tests {
                 medians: vec![1.0],
                 means: vec![1.0],
                 cvs: vec![0.0],
+                rsds: vec![0.0],
             }],
         };
         let mut out = String::new();

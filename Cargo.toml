@@ -27,6 +27,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 ureq = "3.3.0"
 open = "5.3.5"
 egui-phosphor = "0.7.3"
+rust_xlsxwriter = "0.95.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = "0.15"

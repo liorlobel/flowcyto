@@ -197,7 +197,7 @@ fn gate_color(id: u32) -> (Color32, Color32) {
 enum DrawMode { Navigate, Rect, Ellipse, Polygon, Quadrant, Edit }
 
 #[derive(PartialEq, Clone, Copy)]
-enum ActiveTab { Plot, Histogram, Stats, Batch, Spillover, QC }
+enum ActiveTab { Plot, Histogram, Stats, Batch, Spillover, QC, Titration }
 
 #[derive(PartialEq, Clone, Copy)]
 enum BatchMetric { PctParent, PctTotal, Mfi }
@@ -363,6 +363,11 @@ pub struct FlowCytoApp {
     batch_rx: Option<Receiver<BatchMsg>>,        // streamed results from the worker thread
     batch_cancel: Option<Arc<AtomicBool>>,       // set to stop the worker early
     batch_progress: Option<(usize, usize)>,      // (done, total) while a batch runs
+    // Titration tab — per-sample stain index across a dilution series (reads batch results).
+    titration_channel: usize,                    // channel-union index = the titrated fluorochrome
+    titration_pos: Option<u32>,                  // positive population gate id (None = unset)
+    titration_neg: Option<u32>,                  // negative population gate id (None = "All events")
+    titration_logx: bool,                        // log-scale the concentration (dose) axis
     // QC suite — per-tube acquisition quality, streamed like the batch.
     qc_live_gate: Option<u32>,                   // gate designated as the viability population
     qc_rows: Vec<QcRow>,
@@ -465,6 +470,7 @@ impl Default for FlowCytoApp {
             samples: Vec::new(), active_sample: 0, batch: None, batch_channel: 0,
             batch_plot_pop: None, batch_plot_metric: BatchMetric::PctParent,
             batch_rx: None, batch_cancel: None, batch_progress: None,
+            titration_channel: 0, titration_pos: None, titration_neg: None, titration_logx: true,
             qc_live_gate: None, qc_rows: Vec::new(), qc_rx: None, qc_cancel: None, qc_progress: None,
             update_rx: None, update_msg: None, update_found: None,
             ref_sample: None, ref_scatter: None,
@@ -1466,8 +1472,8 @@ impl FlowCytoApp {
             self.drag_start = None; self.drag_current = None; self.poly_vertices.clear();
         }
 
-        const TAB_ORDER: [ActiveTab; 6] = [
-            ActiveTab::Plot, ActiveTab::Histogram, ActiveTab::Stats, ActiveTab::Batch, ActiveTab::Spillover, ActiveTab::QC,
+        const TAB_ORDER: [ActiveTab; 7] = [
+            ActiveTab::Plot, ActiveTab::Histogram, ActiveTab::Stats, ActiveTab::Batch, ActiveTab::Spillover, ActiveTab::QC, ActiveTab::Titration,
         ];
         for (t, &on) in TAB_ORDER.iter().zip(k.tabs.iter()) {
             if on { self.active_tab = *t; }
@@ -1498,8 +1504,8 @@ impl FlowCytoApp {
                 else if let Some(i) = st.tabs.iter().position(|t| *t == id) { acts.push(A::Tab(i)); }
             }
         }
-        const TABS: [ActiveTab; 6] = [
-            ActiveTab::Plot, ActiveTab::Histogram, ActiveTab::Stats, ActiveTab::Batch, ActiveTab::Spillover, ActiveTab::QC,
+        const TABS: [ActiveTab; 7] = [
+            ActiveTab::Plot, ActiveTab::Histogram, ActiveTab::Stats, ActiveTab::Batch, ActiveTab::Spillover, ActiveTab::QC, ActiveTab::Titration,
         ];
         for a in acts {
             match a {
@@ -1575,6 +1581,7 @@ impl FlowCytoApp {
                 ui.selectable_value(&mut self.active_tab, ActiveTab::Batch, format!("{} Batch", icon::STACK));
                 ui.selectable_value(&mut self.active_tab, ActiveTab::Spillover, format!("{} Spillover", icon::GRID_NINE));
                 ui.selectable_value(&mut self.active_tab, ActiveTab::QC, format!("{} QC", icon::HEARTBEAT));
+                ui.selectable_value(&mut self.active_tab, ActiveTab::Titration, format!("{} Titration", icon::DROP));
 
                 // Right-aligned: manual update check (the app's only network call).
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2394,6 +2401,7 @@ impl FlowCytoApp {
                 ActiveTab::Batch => self.batch_view(ui),
                 ActiveTab::Spillover => self.spillover_view(ui),
                 ActiveTab::QC => self.qc_view(ui),
+                ActiveTab::Titration => self.titration_view(ui),
             }
         });
     }
@@ -3546,9 +3554,11 @@ impl FlowCytoApp {
                 .small().color(Color32::GRAY));
         });
         let mut do_export = false;
+        let mut do_xlsx = false;
         let mut do_copy = false;
         ui.horizontal(|ui| {
             if ui.button(format!("{} Export CSV (tidy)", icon::EXPORT)).clicked() { do_export = true; }
+            if ui.button(format!("{} Export XLSX", icon::EXPORT)).clicked() { do_xlsx = true; }
             if ui.button(format!("{} Copy (TSV)", icon::COPY)).on_hover_text("Copy the table as tab-separated text (paste into R/Excel)").clicked() { do_copy = true; }
             ui.label(RichText::new(format!("{} populations × {} channels", table.rows.len(), table.channels.len()))
                 .small().color(Color32::GRAY));
@@ -3594,6 +3604,9 @@ impl FlowCytoApp {
 
         if do_export {
             self.export_popstats_csv();
+        }
+        if do_xlsx {
+            self.export_stats_xlsx();
         }
     }
 
@@ -4164,6 +4177,7 @@ impl FlowCytoApp {
     fn batch_view(&mut self, ui: &mut egui::Ui) {
         let mut do_run = false;
         let mut do_export = false;
+        let mut do_xlsx = false;
         let mut do_copy = false;
         let mut do_cancel = false;
         let mut do_r = false;
@@ -4173,6 +4187,7 @@ impl FlowCytoApp {
             if ui.add_enabled(!running, egui::Button::new("▶ Run over all samples")).clicked() { do_run = true; }
             if running && ui.button(format!("{} Cancel", icon::X)).clicked() { do_cancel = true; }
             if self.batch.is_some() && !running && ui.button(format!("{} Export combined CSV", icon::EXPORT)).clicked() { do_export = true; }
+            if self.batch.is_some() && !running && ui.button(format!("{} Export XLSX", icon::EXPORT)).clicked() { do_xlsx = true; }
             if self.batch.is_some() && !running && ui.button(format!("{} Copy (TSV)", icon::COPY)).on_hover_text("Copy the visible table as tab-separated text").clicked() { do_copy = true; }
             if self.batch.is_some() && !running && ui.button(format!("{} R bundle", icon::EXPORT)).on_hover_text("Export the tidy CSV + a starter .R analysis script wired to your group tags").clicked() { do_r = true; }
         });
@@ -4189,6 +4204,7 @@ impl FlowCytoApp {
         if do_run { self.run_batch(); }
         if do_cancel { self.cancel_batch(); self.status = "Batch cancelled.".into(); }
         if do_export { self.export_batch_csv(); }
+        if do_xlsx { self.export_batch_xlsx(); }
         if do_r { self.export_r_bundle(); }
 
         // Clone display data out of the batch borrow. Each row carries its OWN
@@ -4360,6 +4376,248 @@ impl FlowCytoApp {
             for (s, reason) in &skipped {
                 ui.label(RichText::new(format!("  {} — {}", s, reason)).small());
             }
+        }
+    }
+
+    /// Titration tab — per-sample stain index across a dilution series. A pure view over
+    /// the batch population-stats tables (run a batch first): for the chosen channel,
+    /// SI = (MFI⁺ − MFI⁻)/(2·rSD⁻) using the user's positive and negative populations.
+    fn titration_view(&mut self, ui: &mut egui::Ui) {
+        ui.heading(format!("{} Titration", icon::DROP));
+        ui.label(RichText::new("Stain index across a dilution series. Tag each sample with its antibody concentration (Samples panel), run a batch, then pick the channel and its positive/negative populations — the highest stain index is the optimal amount.")
+            .small().color(Color32::GRAY));
+        ui.separator();
+
+        // Titration reads the batch results.
+        let have_batch = self.batch.as_ref().map(|b| !b.tables.is_empty()).unwrap_or(false);
+        if !have_batch {
+            let running = self.batch_rx.is_some();
+            ui.label(RichText::new("No batch results yet — titration reads the per-sample population stats.").color(Color32::GRAY));
+            if ui.add_enabled(!running, egui::Button::new(format!("{} Run batch over all samples", icon::STACK))).clicked() {
+                self.run_batch();
+            }
+            if let Some((done, total)) = self.batch_progress {
+                let frac = if total > 0 { done as f32 / total as f32 } else { 0.0 };
+                ui.add(egui::ProgressBar::new(frac).show_percentage().text(format!("{}/{}", done, total)));
+            }
+            return;
+        }
+
+        // Channel union + gate options as owned data, so the mutating combos below don't
+        // also borrow self.batch / self.gates.
+        let channels: Vec<String> = {
+            let mut v: Vec<String> = Vec::new();
+            if let Some(b) = &self.batch {
+                for (_, _, t) in &b.tables {
+                    for c in &t.channels {
+                        if !v.iter().any(|x| x.eq_ignore_ascii_case(c)) { v.push(c.clone()); }
+                    }
+                }
+            }
+            v
+        };
+        if channels.is_empty() { ui.label("No channels in the batch results."); return; }
+        let gate_opts: Vec<(u32, String)> = self.gates.iter().map(|g| (g.id, g.name.clone())).collect();
+        let ci = self.titration_channel.min(channels.len() - 1);
+        let pos_disp = self.titration_pos.and_then(|id| gate_opts.iter().find(|(gid, _)| *gid == id))
+            .map(|(_, n)| n.clone()).unwrap_or_else(|| "(pick a gate)".into());
+        let neg_disp = self.titration_neg.and_then(|id| gate_opts.iter().find(|(gid, _)| *gid == id))
+            .map(|(_, n)| n.clone()).unwrap_or_else(|| "All events (rough)".into());
+
+        ui.horizontal(|ui| {
+            ui.label("Channel:");
+            egui::ComboBox::from_id_salt("titr_ch").selected_text(&channels[ci]).show_ui(ui, |ui| {
+                for (i, c) in channels.iter().enumerate() { ui.selectable_value(&mut self.titration_channel, i, c); }
+            });
+            ui.separator();
+            ui.label("Positive:");
+            egui::ComboBox::from_id_salt("titr_pos").selected_text(pos_disp).show_ui(ui, |ui| {
+                for (id, name) in &gate_opts { ui.selectable_value(&mut self.titration_pos, Some(*id), name); }
+            });
+            ui.label("Negative:");
+            egui::ComboBox::from_id_salt("titr_neg").selected_text(neg_disp).show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.titration_neg, None, "All events (rough)");
+                for (id, name) in &gate_opts { ui.selectable_value(&mut self.titration_neg, Some(*id), name); }
+            });
+            ui.separator();
+            ui.checkbox(&mut self.titration_logx, "log dose");
+        });
+
+        // Need a positive population to compute the stain index.
+        let pos_name = match self.titration_pos.and_then(|id| gate_opts.iter().find(|(gid, _)| *gid == id)) {
+            Some((_, n)) => n.clone(),
+            None => {
+                ui.label(RichText::new("Pick the positive population to compute the stain index.").color(Color32::from_rgb(220, 170, 60)));
+                return;
+            }
+        };
+        let neg_name = self.titration_neg.and_then(|id| gate_opts.iter().find(|(gid, _)| *gid == id))
+            .map(|(_, n)| n.clone()).unwrap_or_else(|| "All events".into());
+        let channel = channels[ci].clone();
+
+        // Pure compute — returns owned rows, so no borrow on self.batch is held after.
+        let rows = match &self.batch {
+            Some(b) => crate::titration::titration_rows(&b.tables, &channel, &pos_name, &neg_name),
+            None => return,
+        };
+
+        ui.horizontal(|ui| {
+            if ui.button(format!("{} Export CSV", icon::EXPORT)).clicked() { self.export_titration_csv(&rows); }
+            if ui.button(format!("{} Export XLSX", icon::EXPORT)).clicked() { self.export_titration_xlsx(&channel, &rows); }
+            if self.titration_neg.is_none() {
+                ui.label(RichText::new("negative = All events (rough; gate a real negative for accuracy)").small().color(Color32::from_rgb(220, 170, 60)));
+            }
+        });
+        ui.label(RichText::new(format!("Stain index = (MFI⁺ − MFI⁻) / (2 · rSD⁻) on {} · rSD = robust SD of the negative", channel))
+            .small().color(Color32::GRAY));
+
+        let best = rows.iter().enumerate().filter(|(_, r)| r.si.is_finite())
+            .max_by(|a, b| a.1.si.partial_cmp(&b.1.si).unwrap_or(std::cmp::Ordering::Equal)).map(|(i, _)| i);
+        let teal = Color32::from_rgb(38, 162, 156);
+        let num = |ui: &mut egui::Ui, s: String, hl: bool| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if hl { ui.monospace(RichText::new(s).strong().color(teal)); } else { ui.monospace(s); }
+            });
+        };
+        TableBuilder::new(ui)
+            .striped(true).resizable(true)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::auto().at_least(120.0).clip(true))
+            .column(Column::auto().at_least(70.0))
+            .column(Column::auto().at_least(60.0))
+            .column(Column::auto().at_least(80.0))
+            .column(Column::auto().at_least(80.0))
+            .column(Column::auto().at_least(70.0))
+            .column(Column::remainder().at_least(80.0))
+            .header(22.0, |mut h| {
+                for t in ["Sample", "Conc", "% Pos", "MFI⁺", "MFI⁻", "rSD⁻", "Stain index"] {
+                    h.col(|ui| { ui.strong(t); });
+                }
+            })
+            .body(|body| {
+                body.rows(20.0, rows.len(), |mut row| {
+                    let i = row.index();
+                    let r = &rows[i];
+                    let hl = Some(i) == best;
+                    row.col(|ui| { let t = RichText::new(&r.sample); ui.label(if hl { t.strong().color(teal) } else { t }); });
+                    row.col(|ui| num(ui, r.conc.map(fmt).unwrap_or_else(|| r.group.clone()), hl));
+                    row.col(|ui| num(ui, if r.pct_pos.is_finite() { format!("{:.1}%", r.pct_pos) } else { "NA".into() }, hl));
+                    row.col(|ui| num(ui, fmt(r.mfi_pos), hl));
+                    row.col(|ui| num(ui, fmt(r.mfi_neg), hl));
+                    row.col(|ui| num(ui, fmt(r.rsd_neg), hl));
+                    row.col(|ui| num(ui, if r.si.is_finite() { format!("{:.2}", r.si) } else { "NA".into() }, hl));
+                });
+            });
+
+        // Stain index vs concentration.
+        ui.separator();
+        let logx = self.titration_logx;
+        let xof = |conc: Option<f64>, idx: usize| match conc {
+            Some(c) if logx && c > 0.0 => c.log10(),
+            Some(c) => c,
+            None => idx as f64,
+        };
+        let mut pts: Vec<[f64; 2]> = rows.iter().enumerate()
+            .filter(|(_, r)| r.si.is_finite())
+            .map(|(i, r)| [xof(r.conc, i), r.si]).collect();
+        if pts.is_empty() {
+            ui.label(RichText::new("No finite stain indices to plot (check the channel and pos/negative populations).").small().color(Color32::GRAY));
+        } else {
+            pts.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap_or(std::cmp::Ordering::Equal));
+            let xlab = if logx { "log10(concentration)" } else { "concentration" };
+            Plot::new("titration_plot").height(240.0).allow_scroll(false)
+                .x_axis_label(xlab).y_axis_label("stain index")
+                .show(ui, |pu| {
+                    pu.line(Line::new(PlotPoints::new(pts.clone())).color(teal).width(1.5));
+                    pu.points(Points::new(PlotPoints::new(pts)).radius(4.0).color(teal));
+                    if let Some(bi) = best {
+                        let r = &rows[bi];
+                        pu.points(Points::new(PlotPoints::new(vec![[xof(r.conc, bi), r.si]]))
+                            .radius(7.0).color(Color32::from_rgb(240, 190, 40)));
+                    }
+                });
+        }
+    }
+
+    fn export_titration_csv(&mut self, rows: &[crate::titration::TitrationRow]) {
+        if let Some(path) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).set_file_name("titration.csv").save_file() {
+            let esc = |s: &str| if s.contains(',') || s.contains('"') { format!("\"{}\"", s.replace('"', "\"\"")) } else { s.to_string() };
+            let n4 = |v: f64| if v.is_finite() { format!("{:.4}", v) } else { "NA".to_string() };
+            let mut s = String::from("group,sample,concentration,pct_positive,mfi_pos,mfi_neg,rsd_neg,stain_index\n");
+            for r in rows {
+                s.push_str(&format!("{},{},{},{},{},{},{},{}\n",
+                    esc(&r.group), esc(&r.sample), r.conc.map(|c| c.to_string()).unwrap_or_default(),
+                    n4(r.pct_pos), n4(r.mfi_pos), n4(r.mfi_neg), n4(r.rsd_neg), n4(r.si)));
+            }
+            self.status = match std::fs::write(&path, s) {
+                Ok(_) => format!("Exported titration ({} samples) → {}", rows.len(), path.display()),
+                Err(e) => format!("Export error: {}", e),
+            };
+        }
+    }
+
+    fn export_titration_xlsx(&mut self, channel: &str, rows: &[crate::titration::TitrationRow]) {
+        if let Some(path) = rfd::FileDialog::new().add_filter("Excel", &["xlsx"]).set_file_name("titration.xlsx").save_file() {
+            use crate::xlsx::Cell;
+            let mfi_pos_hdr = format!("mfi_pos ({})", channel);
+            let headers: Vec<&str> = vec!["group", "sample", "concentration", "pct_positive", &mfi_pos_hdr, "mfi_neg", "rsd_neg", "stain_index"];
+            let cells: Vec<Vec<Cell>> = rows.iter().map(|r| vec![
+                Cell::Text(r.group.clone()), Cell::Text(r.sample.clone()),
+                r.conc.map(Cell::Num).unwrap_or_else(|| Cell::Text(r.group.clone())),
+                Cell::Num(r.pct_pos), Cell::Num(r.mfi_pos), Cell::Num(r.mfi_neg), Cell::Num(r.rsd_neg), Cell::Num(r.si),
+            ]).collect();
+            self.status = match crate::xlsx::sheet_bytes("Titration", &headers, &cells).and_then(|b| std::fs::write(&path, b).map_err(|e| e.to_string())) {
+                Ok(_) => format!("Exported titration → {}", path.display()),
+                Err(e) => format!("XLSX export error: {}", e),
+            };
+        }
+    }
+
+    fn export_batch_xlsx(&mut self) {
+        let batch = match &self.batch { Some(b) => b, None => return };
+        if let Some(path) = rfd::FileDialog::new().add_filter("Excel", &["xlsx"]).set_file_name("batch_popstats.xlsx").save_file() {
+            use crate::xlsx::Cell;
+            let headers = ["group", "sample", "population", "parent", "depth", "count", "pct_parent", "pct_total", "channel", "median", "mean", "cv", "rsd"];
+            let mut cells: Vec<Vec<Cell>> = Vec::new();
+            for (group, sample, table) in &batch.tables {
+                for r in &table.rows {
+                    for (k, ch) in table.channels.iter().enumerate() {
+                        cells.push(vec![
+                            Cell::Text(group.clone()), Cell::Text(sample.clone()), Cell::Text(r.name.clone()), Cell::Text(r.parent_name.clone()),
+                            Cell::Num(r.depth as f64), Cell::Num(r.count as f64), Cell::Num(r.pct_parent), Cell::Num(r.pct_total),
+                            Cell::Text(ch.clone()), Cell::Num(r.medians[k]), Cell::Num(r.means[k]), Cell::Num(r.cvs[k]), Cell::Num(r.rsds[k]),
+                        ]);
+                    }
+                }
+            }
+            let n = batch.tables.len();
+            self.status = match crate::xlsx::sheet_bytes("Batch", &headers, &cells).and_then(|b| std::fs::write(&path, b).map_err(|e| e.to_string())) {
+                Ok(_) => format!("Exported batch ({} samples) → {}", n, path.display()),
+                Err(e) => format!("XLSX export error: {}", e),
+            };
+        }
+    }
+
+    fn export_stats_xlsx(&mut self) {
+        let table = match &self.pop_stats { Some(t) => t, None => return };
+        if let Some(path) = rfd::FileDialog::new().add_filter("Excel", &["xlsx"]).set_file_name("popstats.xlsx").save_file() {
+            use crate::xlsx::Cell;
+            let headers = ["population", "parent", "depth", "count", "pct_parent", "pct_total", "channel", "median", "mean", "cv", "rsd"];
+            let mut cells: Vec<Vec<Cell>> = Vec::new();
+            for r in &table.rows {
+                for (k, ch) in table.channels.iter().enumerate() {
+                    cells.push(vec![
+                        Cell::Text(r.name.clone()), Cell::Text(r.parent_name.clone()),
+                        Cell::Num(r.depth as f64), Cell::Num(r.count as f64), Cell::Num(r.pct_parent), Cell::Num(r.pct_total),
+                        Cell::Text(ch.clone()), Cell::Num(r.medians[k]), Cell::Num(r.means[k]), Cell::Num(r.cvs[k]), Cell::Num(r.rsds[k]),
+                    ]);
+                }
+            }
+            let np = table.rows.len();
+            self.status = match crate::xlsx::sheet_bytes("Population stats", &headers, &cells).and_then(|b| std::fs::write(&path, b).map_err(|e| e.to_string())) {
+                Ok(_) => format!("Exported stats ({} populations) → {}", np, path.display()),
+                Err(e) => format!("XLSX export error: {}", e),
+            };
         }
     }
 
