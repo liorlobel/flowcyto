@@ -1,0 +1,58 @@
+# Verified Python environment for the cytoflow cross-check (gen_golden_cytoflow.py).
+# Captured 2026-06-10; Python 3.11 on macOS (Apple Silicon).
+#
+# WHY a plain `pip install -r` will NOT work: cytoflow 1.2 has no wheel for
+# macOS arm64 / Python 3.11 (any version), and its sdist pins a 2021 build stack
+# (old numpy) that fails to build under Python 3.11. Build cytoflow from source
+# first (with build isolation disabled, so it uses the modern numpy/Cython present
+# instead of its pinned ones), then install the rest as wheels:
+#
+#   python3.11 -m venv venv && source venv/bin/activate
+#   pip install "numpy==1.26.4" "Cython==3.2.5" "swig==4.4.1"   # build prerequisites
+#   pip install cytoflow==1.2 --no-build-isolation --no-deps     # compiles Moore's logicle C++ ext
+#   pip install --no-deps -r validation/cytoflow-requirements.txt # --no-deps is REQUIRED: this file pins the
+#       # full transitive closure, and cytoflow 1.2's metadata hard-pins numpy==1.21.2, so letting the resolver
+#       # run would fail with ResolutionImpossible. --no-deps installs exactly the pinned set (verified clean).
+#
+# Run:
+#   python validation/gen_golden_cytoflow.py validation/reference.fcs validation/golden.csv
+#
+# Pin rationale (cytoflow 1.2's 2021 deps lack py311 wheels, so each is the newest
+# version that BOTH has a py311 wheel AND keeps cytoflow 1.2 importable):
+#   numpy<2        ABI compatibility with numba 0.65 + the compiled logicle ext
+#   seaborn 0.11.2 cytoflow imports the private seaborn.categorical._ViolinPlotter (gone in >=0.12)
+#   traits 6.4.0   cytoflow uses traits.api.Function (removed in traits 7)
+#   pandas 1.5.3 / matplotlib 3.6.3   compatible with seaborn 0.11.2
+
+Bottleneck==1.6.0
+contourpy==1.3.3
+cycler==0.12.1
+Cython==3.2.5
+cytoflow==1.2
+decorator==5.3.1
+fcsparser==0.2.8
+FlowCytometryTools==0.5.1
+fonttools==4.63.0
+joblib==1.5.3
+kiwisolver==1.5.0
+llvmlite==0.47.0
+matplotlib==3.6.3
+narwhals==2.22.1
+natsort==8.4.0
+numba==0.65.1
+numpy==1.26.4
+packaging==26.2
+pandas==1.5.3
+patsy==1.0.2
+pillow==12.2.0
+pyparsing==3.3.2
+python-dateutil==2.9.0.post0
+pytz==2026.2
+scikit-learn==1.9.0
+scipy==1.17.1
+seaborn==0.11.2
+six==1.17.0
+statsmodels==0.14.6
+swig==4.4.1
+threadpoolctl==3.6.0
+traits==6.4.0

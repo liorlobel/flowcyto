@@ -8,17 +8,10 @@ reproducing the golden closes a three-way agreement: cytoflow <-> flowCore <-> f
 Run inside a cytoflow venv (cytoflow 1.2):
     python validation/gen_golden_cytoflow.py validation/reference.fcs validation/golden.csv
 
-Environment (cytoflow has NO wheel for macOS arm64 / Python 3.11 - it is a from-source
-build, and v1.2 pins a 2021 stack with no py311 wheels, so a few deps are pinned to the
-newest version that both has a py311 wheel and keeps cytoflow 1.2's API):
-    python3.11 -m venv venv && source venv/bin/activate
-    pip install swig "numpy<2" cython            # SWIG builds cytoflow's logicle C++ ext
-    pip install cytoflow --no-build-isolation --no-deps
-    pip install scipy scikit-learn statsmodels FlowCytometryTools numba \
-        "seaborn==0.11.2" "pandas==1.5.3" "matplotlib==3.6.3" "traits==6.4.0"
-Verified-working pins: cytoflow 1.2, numpy 1.26.4, scipy 1.17.1, pandas 1.5.3,
-matplotlib 3.6.3, seaborn 0.11.2, traits 6.4.0, numba 0.65.1, FlowCytometryTools 0.5.1,
-fcsparser 0.2.8. Result table is saved alongside in `cytoflow_crosscheck.txt`.
+Environment: cytoflow has NO wheel for macOS arm64 / Python 3.11 - it is a from-source
+build. See `validation/cytoflow-requirements.txt` for the exact verified pins and the
+staged install recipe (build cytoflow with --no-build-isolation, then
+`pip install --no-deps -r`). Result table is saved alongside in `cytoflow_crosscheck.txt`.
 
 What is genuinely INDEPENDENT here (honest framing, per the paper's discipline):
   * parse   - cytoflow's FCS reader (fcsparser); a different codebase from flowCore's.
