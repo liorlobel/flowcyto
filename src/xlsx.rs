@@ -13,6 +13,14 @@ pub enum Cell {
 
 /// Serialize one worksheet (a bold header row + data rows) to in-memory `.xlsx` bytes.
 pub fn sheet_bytes(sheet: &str, headers: &[&str], rows: &[Vec<Cell>]) -> Result<Vec<u8>, String> {
+    // Excel limits are 16,384 cols × 1,048,576 rows; guard so the `as u16`/`as u32` cell
+    // indices below cannot silently wrap (writing to the wrong cell) past those widths.
+    if headers.len() > 16_384 {
+        return Err(format!("too many columns for .xlsx ({} > 16384)", headers.len()));
+    }
+    if rows.len() > 1_048_575 {
+        return Err(format!("too many rows for .xlsx ({} > 1048575)", rows.len()));
+    }
     let mut wb = Workbook::new();
     let ws = wb.add_worksheet();
     ws.set_name(sheet).map_err(|e| e.to_string())?;

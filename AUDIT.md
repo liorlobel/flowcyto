@@ -382,3 +382,47 @@ M3, L1, L2, L3 are all unguarded by tests.
    a `retain(is_finite)` before median) closes M1b/c/d; add a conditioning check for M1a.
 3. **M2** (+ L8) — `checked_mul` + `data_len` bound at the parser; add the Stats-tab guard.
 4. **M3** — the `out_path == path` guard (cheap, prevents data loss).
+
+---
+
+# v0.1.22 audit (2026-06-10) — addendum
+
+> **Status: all findings FIXED in the working tree** — 1 Medium + 6 Lows, no
+> Critical/High. clippy `-D warnings` clean, **134 tests** pass (1 new regression test
+> for the Medium). This pass targeted the code added since v0.1.20 — titration /
+> stain-index, XLSX export, the N×N compensation cross-check, the grid axis-control
+> redesign — plus a broad regression sweep of the mature core.
+
+Four parallel review passes — new analysis numerics · cross-check + grid GUI · titration
+view + exporters + file I/O · broad core sweep — every finding re-verified at its
+`file:line`. **Headline: the codebase is in good shape.** The mature core (FCS parser,
+gating, transforms, logicle, compensation apply, autogate) is clean and still carries its
+prior-audit hardening; the new stain-index/coefficient/rSD math, `vertical_picker`, and
+borrow / lifetime / file-write safety all check out. Findings clustered in the new code.
+
+- **M1 [Medium] — FIXED.** Transform-parameter edits (asinh cofactor, logicle `w/t/m/a`,
+  log floor) left the grid, single-scatter, histogram, and N×N cross-check caches silently
+  stale: the staleness key was `AxisTransform::short_label()`, which is param-free (`"Asinh"`
+  for any cofactor). A param edit only fires `needs_rescatter` (rebuilds the single scatter,
+  not the gen-keyed caches), so the grid/cross-check kept rendering the old transform — and
+  for the cross-check the stale display transform shifts the valley split, corrupting the
+  residual *number*, not just the plot. **Fix:** added `AxisTransform::key()` (param-inclusive,
+  e.g. `"Asinh:150"`) and keyed all those caches on it. Regression test
+  `transform::key_distinguishes_parameters`.
+- **L1 [Low] — FIXED.** `titration.rs` parsed tags `"inf"`/`"nan"` to `Some(non-finite)`,
+  poisoning the dose-plot sort + CSV/XLSX concentration column. Fix: `.filter(|c| c.is_finite())`.
+- **L2 [Low] — FIXED.** Titration CSV wrote a blank concentration for a non-numeric tag but
+  the XLSX wrote the tag *text* into the numeric column. Fix: XLSX emits a blank cell.
+- **L3 [Low] — FIXED.** The SI-vs-dose plot used the row index as x for non-numeric tags
+  (colliding with real concentrations) and plotted conc ≤ 0 at the linear value under a log
+  axis. Fix: plot only samples with a numeric (log-mode: positive) concentration.
+- **L4 [Low] — FIXED.** `build_comp_check` guarded `compensated.len() < np` instead of
+  `< n_events*np` (latent OOB; not triggerable today). Fix: top-of-function `< n_events*np` guard.
+- **L5 [Low] — FIXED.** `save_matrix_file` indexed `channels[i]` over `rows` with no
+  squareness check (panic on non-square; internal-misuse only). Fix: `validate_square` first.
+- **L6 [Low] — FIXED.** `xlsx::sheet_bytes`'s `as u16`/`as u32` cell-index casts wrapped past
+  Excel's limits (unreachable with real tables). Fix: explicit limit check → `Err`.
+
+**Notes (not bugs, no change):** the cross-check lags an override-matrix cell edit by one
+frame then self-corrects (`needs_reprocess`→`reprocess`→`data_gen`); the FCS value-count DoS
+bound under-counts by the datatype byte width but surplus reads error cleanly (no panic/OOM).

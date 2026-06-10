@@ -110,6 +110,7 @@ pub fn load_matrix_file(path: &std::path::Path) -> Result<(Vec<String>, Vec<Vec<
 
 /// Save a spillover matrix to CSV (default) or JSON (if path ends in .json).
 pub fn save_matrix_file(path: &std::path::Path, channels: &[String], rows: &[Vec<f64>]) -> Result<()> {
+    validate_square(channels, rows)?; // square (prevents an OOB `channels[i]` in the CSV branch) + finite
     // Never persist a non-finite matrix (e.g. from a degenerate control) — it would
     // poison any later `compensate`. (Defense-in-depth alongside the median fix.)
     if rows.iter().flatten().any(|v| !v.is_finite()) {

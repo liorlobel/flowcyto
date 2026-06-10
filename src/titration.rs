@@ -58,7 +58,7 @@ pub fn titration_rows(
         out.push(TitrationRow {
             group: group.clone(),
             sample: sample.clone(),
-            conc: group.trim().parse::<f64>().ok(),
+            conc: group.trim().parse::<f64>().ok().filter(|c| c.is_finite()),
             pct_pos,
             mfi_pos,
             mfi_neg,

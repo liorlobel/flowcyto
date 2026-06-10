@@ -744,8 +744,8 @@ impl FlowCytoApp {
 
         self.scatter = Some(ScatterCache {
             buckets, x_ch: xi, y_ch: yi,
-            x_label: self.cur_tf(xi).short_label().to_string(),
-            y_label: self.cur_tf(yi).short_label().to_string(),
+            x_label: self.cur_tf(xi).key(),
+            y_label: self.cur_tf(yi).key(),
             pop: self.active_pop,
             back_pts,
             contours,
@@ -948,8 +948,8 @@ impl FlowCytoApp {
             .collect();
         self.ref_scatter = Some(RefScatter {
             ref_idx, x_ch: xi, y_ch: yi,
-            x_label: self.cur_tf(xi).short_label().to_string(),
-            y_label: self.cur_tf(yi).short_label().to_string(),
+            x_label: self.cur_tf(xi).key(),
+            y_label: self.cur_tf(yi).key(),
             points,
         });
     }
@@ -1361,7 +1361,7 @@ impl FlowCytoApp {
             (centers, series)
         };
 
-        let x_label = self.cur_tf(xi).short_label().to_string();
+        let x_label = self.cur_tf(xi).key();
         self.hist_cache = Some(HistogramData {
             x_ch: xi, x_label, norm, mode: self.hist_mode, sample_pop: self.hist_sample_pop, centers, series,
         });
@@ -2496,14 +2496,14 @@ impl FlowCytoApp {
         let cur_yt = self.cur_tf(yi);
         let stale = self.grid_cache[idx].as_ref().map(|c| {
             c.xi != xi || c.yi != yi || c.gen != self.data_gen || c.pop != self.active_pop
-                || c.x_label != cur_xt.short_label() || c.y_label != cur_yt.short_label()
+                || c.x_label != cur_xt.key() || c.y_label != cur_yt.key()
         }).unwrap_or(true);
         if stale {
             let k = kept.get_or_insert_with(|| self.grid_kept());
             let buckets = self.compute_cell_buckets(xi, yi, k, cap);
             self.grid_cache[idx] = Some(GridCell {
-                xi, yi, x_label: cur_xt.short_label().to_string(),
-                y_label: cur_yt.short_label().to_string(),
+                xi, yi, x_label: cur_xt.key(),
+                y_label: cur_yt.key(),
                 pop: self.active_pop, gen: self.data_gen, buckets,
             });
         }
@@ -2931,8 +2931,8 @@ impl FlowCytoApp {
         // Stale-scatter guard: rebuild if channel/transform changed without a flag.
         let stale = self.scatter.as_ref().map(|s| {
             s.x_ch != xi || s.y_ch != yi
-                || s.x_label != cur_xt.short_label()
-                || s.y_label != cur_yt.short_label()
+                || s.x_label != cur_xt.key()
+                || s.y_label != cur_yt.key()
                 || s.pop != self.active_pop
         }).unwrap_or(true);
         if stale { self.rebuild_scatter(); }
@@ -2941,7 +2941,7 @@ impl FlowCytoApp {
         if self.ref_sample.is_some() {
             let ref_stale = self.ref_scatter.as_ref().map(|r| {
                 Some(r.ref_idx) != self.ref_sample || r.x_ch != xi || r.y_ch != yi
-                    || r.x_label != cur_xt.short_label() || r.y_label != cur_yt.short_label()
+                    || r.x_label != cur_xt.key() || r.y_label != cur_yt.key()
             }).unwrap_or(true);
             if ref_stale { self.rebuild_ref_scatter(); }
         } else if self.ref_scatter.is_some() {
@@ -3337,7 +3337,7 @@ impl FlowCytoApp {
         let x_name = self.fcs.as_ref().map(|f| param_full_label(f, xi)).unwrap_or_default();
 
         let stale = self.hist_cache.as_ref().map(|h| {
-            h.x_ch != xi || h.x_label != cur_xt.short_label() || h.norm != self.hist_norm
+            h.x_ch != xi || h.x_label != cur_xt.key() || h.norm != self.hist_norm
                 || h.mode != self.hist_mode || h.sample_pop != self.hist_sample_pop
         }).unwrap_or(true);
         if stale { self.rebuild_histogram(); }
@@ -4529,19 +4529,20 @@ impl FlowCytoApp {
                 });
             });
 
-        // Stain index vs concentration.
+        // Stain index vs concentration — only samples with a numeric concentration tag
+        // (and, in log mode, a positive one); others have no real place on the dose axis.
         ui.separator();
         let logx = self.titration_logx;
-        let xof = |conc: Option<f64>, idx: usize| match conc {
-            Some(c) if logx && c > 0.0 => c.log10(),
-            Some(c) => c,
-            None => idx as f64,
+        let xof = |conc: Option<f64>| -> Option<f64> {
+            let c = conc?;
+            if logx { (c > 0.0).then(|| c.log10()) } else { Some(c) }
         };
-        let mut pts: Vec<[f64; 2]> = rows.iter().enumerate()
-            .filter(|(_, r)| r.si.is_finite())
-            .map(|(i, r)| [xof(r.conc, i), r.si]).collect();
+        let mut pts: Vec<[f64; 2]> = rows.iter()
+            .filter(|r| r.si.is_finite())
+            .filter_map(|r| xof(r.conc).map(|x| [x, r.si]))
+            .collect();
         if pts.is_empty() {
-            ui.label(RichText::new("No finite stain indices to plot (check the channel and pos/negative populations).").small().color(Color32::GRAY));
+            ui.label(RichText::new("Nothing to plot — tag samples with a numeric concentration (positive, for the log axis) and a finite stain index.").small().color(Color32::GRAY));
         } else {
             pts.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap_or(std::cmp::Ordering::Equal));
             let xlab = if logx { "log10(concentration)" } else { "concentration" };
@@ -4550,9 +4551,8 @@ impl FlowCytoApp {
                 .show(ui, |pu| {
                     pu.line(Line::new(PlotPoints::new(pts.clone())).color(teal).width(1.5));
                     pu.points(Points::new(PlotPoints::new(pts)).radius(4.0).color(teal));
-                    if let Some(bi) = best {
-                        let r = &rows[bi];
-                        pu.points(Points::new(PlotPoints::new(vec![[xof(r.conc, bi), r.si]]))
+                    if let Some(bp) = best.and_then(|bi| xof(rows[bi].conc).map(|x| [x, rows[bi].si])) {
+                        pu.points(Points::new(PlotPoints::new(vec![bp]))
                             .radius(7.0).color(Color32::from_rgb(240, 190, 40)));
                     }
                 });
@@ -4583,7 +4583,7 @@ impl FlowCytoApp {
             let headers: Vec<&str> = vec!["group", "sample", "concentration", "pct_positive", &mfi_pos_hdr, "mfi_neg", "rsd_neg", "stain_index"];
             let cells: Vec<Vec<Cell>> = rows.iter().map(|r| vec![
                 Cell::Text(r.group.clone()), Cell::Text(r.sample.clone()),
-                r.conc.map(Cell::Num).unwrap_or_else(|| Cell::Text(r.group.clone())),
+                r.conc.map(Cell::Num).unwrap_or_else(|| Cell::Text(String::new())), // blank, keep the column numeric
                 Cell::Num(r.pct_pos), Cell::Num(r.mfi_pos), Cell::Num(r.mfi_neg), Cell::Num(r.rsd_neg), Cell::Num(r.si),
             ]).collect();
             self.status = match crate::xlsx::sheet_bytes("Titration", &headers, &cells).and_then(|b| std::fs::write(&path, b).map_err(|e| e.to_string())) {
@@ -4870,12 +4870,21 @@ impl FlowCytoApp {
     fn build_comp_check(&self, chans: &[(usize, String)], tkey: String) -> CompCheck {
         let n = chans.len();
         let np = self.fcs.as_ref().map(|f| f.n_params()).unwrap_or(1).max(1);
+        let n_events = self.fcs.as_ref().map(|f| f.n_events).unwrap_or(0);
         let kept = self.grid_kept();
+        // `compensated` should always be full length here (reprocess keeps it so), but a
+        // short buffer would OOB-index the `e*np + ..` accesses below — return empty cells.
+        if self.compensated.len() < n_events * np {
+            return CompCheck {
+                gen: self.data_gen, pop: self.active_pop, comp: self.do_compensate, tkey,
+                chans: chans.to_vec(),
+                cells: (0..n * n).map(|_| CompCell { buckets: Vec::new(), residual: None }).collect(),
+            };
+        }
         let cap = (24_000 / (n * n).max(1)).clamp(500, 4000);
         // Split each source (column) channel at its density valley ONCE, reused down the
         // column; None when not cleanly bimodal → the residual reads n/a.
         let col_masks: Vec<Option<(Vec<bool>, Vec<bool>, Vec<f64>)>> = chans.iter().map(|(ci, _)| {
-            if self.compensated.len() < np { return None; }
             let x_lin: Vec<f64> = kept.iter().map(|&e| self.compensated[e * np + ci]).collect();
             let xt = self.cur_tf(*ci).compile();
             let dx_disp: Vec<f64> = x_lin.iter().map(|&v| xt.forward(v)).collect();
@@ -4909,7 +4918,7 @@ impl FlowCytoApp {
 
     /// Transform signature of the cross-check channels — invalidates the cache on a scale change.
     fn comp_check_tkey(&self, chans: &[(usize, String)]) -> String {
-        chans.iter().map(|(i, _)| self.cur_tf(*i).short_label()).collect::<Vec<_>>().join(",")
+        chans.iter().map(|(i, _)| self.cur_tf(*i).key()).collect::<Vec<_>>().join(",")
     }
 
     /// The N×N compensation cross-check grid (each off-diagonal cell: column channel x vs

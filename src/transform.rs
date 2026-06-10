@@ -49,6 +49,18 @@ impl AxisTransform {
         }
     }
 
+    /// Cache key that DISTINGUISHES transform parameters (unlike `short_label`, which is
+    /// param-free). Plot/stat caches key on this so editing a cofactor / logicle param /
+    /// log floor invalidates them — `short_label` alone would leave them silently stale.
+    pub fn key(&self) -> String {
+        match self {
+            AxisTransform::Linear => "Linear".into(),
+            AxisTransform::Log { floor } => format!("Log:{floor}"),
+            AxisTransform::Asinh { cofactor } => format!("Asinh:{cofactor}"),
+            AxisTransform::Logicle { t, w, m, a } => format!("Logicle:{t},{w},{m},{a}"),
+        }
+    }
+
     /// Compile into a runtime engine (builds the Logicle scale once).
     /// Falls back to Linear if logicle parameters are invalid.
     pub fn compile(&self) -> CompiledTransform {
@@ -268,5 +280,26 @@ mod tests {
         assert_eq!(AxisTransform::default_log().short_label(), "Log");
         assert_eq!(AxisTransform::Asinh { cofactor: 1.0 }.short_label(), "Asinh");
         assert_eq!(AxisTransform::default_logicle().short_label(), "Logicle");
+    }
+
+    #[test]
+    fn key_distinguishes_parameters() {
+        // The cache key MUST change with parameters (unlike short_label) — else plot/stat
+        // caches go stale on a cofactor/logicle edit (audit M1).
+        assert_ne!(
+            AxisTransform::Asinh { cofactor: 150.0 }.key(),
+            AxisTransform::Asinh { cofactor: 200.0 }.key()
+        );
+        assert_eq!(
+            AxisTransform::Asinh { cofactor: 150.0 }.key(),
+            AxisTransform::Asinh { cofactor: 150.0 }.key()
+        );
+        let lg = |w: f64| AxisTransform::Logicle { t: 262144.0, w, m: 4.5, a: 0.0 }.key();
+        assert_ne!(lg(0.5), lg(1.0));
+        // short_label stays param-free (those two would collide under it).
+        assert_eq!(
+            AxisTransform::Asinh { cofactor: 150.0 }.short_label(),
+            AxisTransform::Asinh { cofactor: 200.0 }.short_label()
+        );
     }
 }
