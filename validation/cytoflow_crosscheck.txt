@@ -1,0 +1,15 @@
+
+cytoflow 1.2 cross-check vs frozen flowCore 2.24.0 golden
+(same reference.fcs, same probes/params as validation/gen_golden.R)
+
+Layer          Probes    Max rel dev    Counts   Result
+-------------------------------------------------------
+Parsing           120       3.82e-10         -     PASS
+Compensation      120       4.47e-10         -     PASS
+Asinh              15       4.73e-11         -     PASS
+Logicle            15       1.07e-10         -     PASS
+Gating              6       1.90e-10     exact     PASS
+
+gate counts: Cells=566 FITC+=200 PE+=160  (golden 566 / 200 / 160)
+
+ALL LAYERS REPRODUCE THE flowCore GOLDEN — three-way agreement cytoflow <-> flowCore <-> flowcyto.
