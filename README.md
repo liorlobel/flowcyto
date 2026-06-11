@@ -6,7 +6,8 @@
 
 A fast, native **macOS &amp; Windows app (and CLI)** for analyzing BD
 flow-cytometry `.fcs` files — compensation, Linear/Log/Asinh/Logicle transforms,
-hierarchical gating, per-population statistics, and multi-sample batch export.
+hierarchical gating, per-population statistics, antibody-titration stain
+indices, and multi-sample batch export (CSV/XLSX).
 Every numeric layer is cross-validated against
 R/[flowCore](https://bioconductor.org/packages/flowCore/).
 
@@ -56,10 +57,11 @@ click **More info → Run anyway**.
    see (and gate on) the whole gating sequence at once.
 
 5. **Read the numbers.** The **Stats** tab shows a per-population table
-   (count, %parent, %total, median MFI per channel) with **💾 Export CSV (tidy)**.
-   With multiple files open, the **Batch** tab runs your whole gate tree over every
-   sample and exports one combined tidy CSV — tag each sample with a **group**
-   (condition) in the Samples list and it becomes a column in the output.
+   (count, %parent, %total, median MFI per channel) — export it as a tidy **CSV**
+   or a formatted **XLSX**. With multiple files open, the **Batch** tab runs your
+   whole gate tree over every sample and exports one combined table (CSV or XLSX) —
+   tag each sample with a **group** (condition) in the Samples list and it becomes a
+   column in the output.
 
 **Save your work:** **💾 Save** (in Gates) writes the gate tree to JSON; the
 toolbar's **🖫 Save session** stores everything — samples, gates, transforms, and
@@ -89,14 +91,24 @@ compensation — to reopen later.
   as CSV.
 - **Histogram** tab: 1-D overlays of populations or samples; drag to add an
   interval gate.
+- **Titration** tab: for an antibody dilution series, the per-sample **stain index**
+  — `(MFI⁺ − MFI⁻) / (2·rSD⁻)`, the robust-SD definition FlowJo uses — on the chosen
+  channel, with the optimal (highest-index) concentration highlighted and a
+  stain-index-vs-dose curve. Tag each sample with its concentration, pick the
+  positive and negative populations, and export CSV/XLSX. (Runs over the Batch
+  results, so it's a view across your whole dilution series.)
 - **Spillover** tab: view/edit the compensation matrix, or compute one from
   single-stain controls; the inline **⚖ Compensation** panel on the Plot tab
-  adjusts the current X↔Y spillover with a live preview.
+  adjusts the current X↔Y spillover with a live preview; and the **N×N cross-check**
+  lays out every fluorochrome pair on compensated data with a residual-spillover
+  flag, so over-/under-compensation is visible at a glance (the flag is a
+  spillover-coefficient estimate — quantitative on single-stain controls, a visual
+  check on mixed samples).
 - **Menu bar (macOS):** native **File / Edit / View** menus mirror the in-app
   controls — Open FCS (⌘O), Save Gates (⌘S) / Session (⇧⌘S), Undo/Redo (⌘Z / ⇧⌘Z),
-  switch tabs (⌘1–⌘5), toggle light/dark.
+  switch tabs (⌘1–⌘6), toggle light/dark.
 - **Keyboard:** `R`/`E`/`P`/`Q` draw tools, `G` edit, `V`/`Esc` navigate,
-  `Ctrl/Cmd+Z` undo, `1`–`5` switch tabs.
+  `Ctrl/Cmd+Z` undo, `1`–`6` switch tabs.
 - **Appearance:** light/dark themes and five density colormaps — **Viridis**
   (default), **Magma**, **Turbo**, **Cividis** (all perceptually-uniform and
   colorblind-safe), and **Jet** (legacy). The chosen colormap is saved with the
@@ -123,7 +135,8 @@ flowcyto selftest                                    # verify the numerics vs fl
 
 ### Validated against flowCore — and you can check it yourself
 
-`flowcyto selftest` recomputes parsing, compensation, asinh, and logicle on a bundled
+`flowcyto selftest` recomputes parsing, compensation, asinh, logicle, and gating
+(population counts + median MFI) on a bundled
 reference and compares to **frozen R/[flowCore](https://bioconductor.org/packages/flowCore/)
 golden values** — offline, no R needed. It prints a benchmark table and exits non-zero
 on any deviation (it's also part of the test suite, so CI guards it on every change):
@@ -132,6 +145,7 @@ on any deviation (it's also part of the test suite, so CI guards it on every cha
 Layer                 Probes    Max rel. dev   Tolerance   Result
 Asinh transform           15        4.73e-11        1e-5     PASS
 Compensation             120        4.47e-10        1e-5     PASS
+Gating                     6        1.90e-10        1e-5     PASS
 Logicle transform         15        1.07e-10        1e-5     PASS
 Parsing                  120        3.82e-10        1e-5     PASS
 ```
@@ -144,7 +158,7 @@ Requires the Rust toolchain.
 
 ```bash
 cargo build --release          # binary at target/release/flowcyto
-cargo test --release           # 88 tests
+cargo test --release           # 134 tests
 ./packaging/make-macos-app.sh  # macOS: build the .app + .dmg
 ```
 
