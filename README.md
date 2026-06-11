@@ -4,7 +4,7 @@
 
 <h1 align="center">flowcyto</h1>
 
-A fast, native **macOS &amp; Windows app (and CLI)** for analyzing BD
+A fast, native **macOS, Windows &amp; Linux app (and CLI)** for analyzing BD
 flow-cytometry `.fcs` files — compensation, Linear/Log/Asinh/Logicle transforms,
 hierarchical gating, per-population statistics, antibody-titration stain
 indices, and multi-sample batch export (CSV/XLSX).
@@ -30,6 +30,15 @@ Privacy & Security on macOS 15+). Full details: [INSTALL.md](INSTALL.md).
 **Windows (x64)** — download **`flowcyto-<version>-setup.exe`** and run it
 (Start-Menu shortcut + uninstaller). It's unsigned, so SmartScreen may warn:
 click **More info → Run anyway**.
+
+**Linux (x64)** — two options:
+- **AppImage** (**`flowcyto-<version>-x86_64.AppImage`**) — `chmod +x` it and run; no
+  install needed. It expects FUSE; if that's unavailable, run it with
+  `./flowcyto-<version>-x86_64.AppImage --appimage-extract-and-run`.
+- **Debian/Ubuntu `.deb`** (**`flowcyto_<version>-1_amd64.deb`**) —
+  `sudo apt install ./flowcyto_<version>-1_amd64.deb`, which pulls in the few
+  GL/xkb libraries it needs and adds a desktop entry. Built on Ubuntu 22.04 for
+  broad glibc compatibility.
 
 ## Tutorial: gate a sample in 5 steps
 
@@ -160,10 +169,12 @@ Requires the Rust toolchain.
 cargo build --release          # binary at target/release/flowcyto
 cargo test --release           # 134 tests
 ./packaging/make-macos-app.sh  # macOS: build the .app + .dmg
+./packaging/make-appimage.sh   # Linux: build the AppImage (.deb via `cargo deb`)
 ```
 
 The installers are also built by CI: pushing a `vX.Y.Z` tag runs the
-[macOS](.github/workflows/macos-installer.yml) and
-[Windows](.github/workflows/windows-installer.yml) workflows, which build the
-`.dmg` (on a Mac runner) and the Inno Setup `.exe` (on a Windows runner) and
-attach both to the GitHub release.
+[macOS](.github/workflows/macos-installer.yml),
+[Windows](.github/workflows/windows-installer.yml), and
+[Linux](.github/workflows/linux-installer.yml) workflows, which build the
+`.dmg` (on a Mac runner), the Inno Setup `.exe` (on a Windows runner), and the
+`.deb` + AppImage (on Ubuntu) and attach them all to the GitHub release.
